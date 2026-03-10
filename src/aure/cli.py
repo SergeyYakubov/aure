@@ -1926,11 +1926,21 @@ def mcp_server(transport: str, port: int):
     help="Port to run the web server on (default: 5000)",
 )
 @click.option(
+    "--host",
+    default="127.0.0.1",
+    show_default=True,
+    help=(
+        "Interface to bind to. Use 0.0.0.0 to listen on all interfaces "
+        "(e.g. inside Docker). Only use this on trusted networks or behind "
+        "proper network controls, as the web UI is not authenticated."
+    ),
+)
+@click.option(
     "--no-browser",
     is_flag=True,
     help="Don't open a browser automatically",
 )
-def serve(output_dir: Optional[str], port: int, no_browser: bool):
+def serve(output_dir: Optional[str], port: int, host: str, no_browser: bool):
     """
     Launch the AuRE web interface.
 
@@ -1964,7 +1974,8 @@ def serve(output_dir: Optional[str], port: int, no_browser: bool):
         click.echo(f"  Output dir: {output_dir}")
     else:
         click.echo("  Mode:       interactive setup")
-    click.echo(f"  URL:        http://127.0.0.1:{port}")
+    display_host = "localhost" if host == "0.0.0.0" else host
+    click.echo(f"  URL:        http://{display_host}:{port}")
     click.echo()
 
     app = create_app(output_dir)
@@ -1973,9 +1984,11 @@ def serve(output_dir: Optional[str], port: int, no_browser: bool):
         import threading
         import webbrowser
 
-        threading.Timer(1.0, webbrowser.open, args=[f"http://127.0.0.1:{port}"]).start()
+        threading.Timer(
+            1.0, webbrowser.open, args=[f"http://{display_host}:{port}"]
+        ).start()
 
-    app.run(host="127.0.0.1", port=port, debug=False)
+    app.run(host=host, port=port, debug=False)
 
 
 # ============================================================================
@@ -1986,7 +1999,18 @@ def serve(output_dir: Optional[str], port: int, no_browser: bool):
 @cli.command("interactive")
 @click.argument("data_file", type=click.Path(exists=True), required=False)
 @click.option("--port", "-p", default=5000, type=int, help="Port (default: 5000)")
-def interactive(data_file: Optional[str], port: int):
+@click.option(
+    "--host",
+    default="127.0.0.1",
+    show_default=True,
+    help=(
+        "Interface to bind to. Use 0.0.0.0 to listen on all interfaces "
+        "(e.g. inside Docker). Warning: this exposes the unauthenticated "
+        "web UI/API and should only be used with appropriate network "
+        "restrictions."
+    ),
+)
+def interactive(data_file: Optional[str], port: int, host: str):
     """
     Start an interactive analysis session in the browser.
 
@@ -1998,7 +2022,8 @@ def interactive(data_file: Optional[str], port: int):
     click.echo(click.style("  AuRE – Interactive Mode", fg="blue", bold=True))
     click.echo(click.style("═" * 60, fg="blue"))
     click.echo()
-    click.echo(f"  URL: http://127.0.0.1:{port}")
+    display_host = "localhost" if host == "0.0.0.0" else host
+    click.echo(f"  URL: http://{display_host}:{port}")
     click.echo()
 
     app = create_app()
@@ -2006,9 +2031,11 @@ def interactive(data_file: Optional[str], port: int):
     import threading
     import webbrowser
 
-    threading.Timer(1.0, webbrowser.open, args=[f"http://127.0.0.1:{port}"]).start()
+    threading.Timer(
+        1.0, webbrowser.open, args=[f"http://{display_host}:{port}"]
+    ).start()
 
-    app.run(host="127.0.0.1", port=port, debug=False)
+    app.run(host=host, port=port, debug=False)
 
 
 # ============================================================================
