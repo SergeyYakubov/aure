@@ -294,86 +294,99 @@ def check_llm(output_json: bool, no_test: bool, fix: bool):
     info = get_llm_info()
     has_key = bool(config.get("api_key"))
 
+    # For ALCF the credential is an access token, not an API key
+    if config["provider"] == "alcf":
+        has_credential = bool(os.environ.get("ALCF_ACCESS_TOKEN"))
+    else:
+        has_credential = has_key
+
+    if not output_json:
+        click.echo()
+        click.echo(click.style("  LLM Configuration Check", fg="blue", bold=True))
+        click.echo(click.style("  " + "─" * 40, fg="blue"))
+        click.echo()
+        click.echo(f"    Provider:    {config['provider'] or '(not set)'}")
+        click.echo(f"    Model:       {config['model']}")
+        if config["provider"] == "alcf":
+            has_token = bool(os.environ.get("ALCF_ACCESS_TOKEN"))
+            click.echo(
+                f"    Token:       {'••••' + os.environ['ALCF_ACCESS_TOKEN'][-4:] if has_token else click.style('NOT SET', fg='red')}"
+            )
+            click.echo(f"    ALCF cluster: {config.get('alcf_cluster', 'sophia')}")
+            click.echo(f"    Base URL:    {info.get('base_url', '(unknown)')}")
+        else:
+            click.echo(
+                f"    API key:     {'••••' + config['api_key'][-4:] if has_key else click.style('NOT SET', fg='red')}"
+            )
+            if config.get("base_url"):
+                click.echo(f"    Base URL:    {config['base_url']}")
+        click.echo(f"    Timeout:     {get_llm_timeout()}s")
+        click.echo(f"    Temperature: {config['temperature']}")
+        click.echo()
+
+    if not info["available"]:
+        if output_json:
+            ok, msg = False, "LLM not configured (missing API key or base URL)"
+        else:
+            ok, msg = False, "LLM not available"
+            click.echo(click.style("  ✗ LLM not available", fg="red", bold=True))
+            click.echo()
+            if config["provider"] == "alcf":
+                click.echo("    Authenticate with ALCF to obtain an access token:")
+                click.echo()
+                _show_alcf_auth_hint(offer_fix=fix)
+                click.echo()
+                click.echo("    Then set the token:")
+                click.echo("      export ALCF_ACCESS_TOKEN=<your-token>")
+            elif config["provider"] in ("openai", "gemini") and not has_key:
+                click.echo("    Set an API key:")
+                click.echo("      export LLM_API_KEY=<your-key>")
+                click.echo("    or add to .env:")
+                click.echo(f"      LLM_PROVIDER={config['provider']}")
+                click.echo("      LLM_API_KEY=<your-key>")
+            elif config["provider"] == "local" and not config.get("base_url"):
+                click.echo("    Set a base URL for local provider:")
+                click.echo("      export LLM_BASE_URL=http://localhost:11434/v1")
+            click.echo()
+    elif no_test:
+        ok, msg = True, "Credentials present (skipped live test)"
+        if not output_json:
+            click.echo(
+                click.style("  ✓ Credentials present (skipped live test)", fg="green")
+            )
+            click.echo()
+    else:
+        if not output_json:
+            click.echo("    Testing connection...", nl=False)
+        ok, msg = _check_llm_status(quiet=True, test_connection=True)
+        if not output_json:
+            if ok:
+                click.echo(click.style(" ✓ Connected", fg="green"))
+            else:
+                click.echo(click.style(f" ✗ {msg}", fg="red"))
+                if config["provider"] == "alcf":
+                    click.echo()
+                    click.echo(
+                        click.style(
+                            "    ALCF tokens expire periodically. Re-authenticate:",
+                            fg="yellow",
+                        )
+                    )
+                    click.echo()
+                    _show_alcf_auth_hint(offer_fix=fix)
+            click.echo()
+
     if output_json:
-        ok, msg = _check_llm_status(quiet=True, test_connection=not no_test)
         result = {
             **info,
-            "has_api_key": has_key,
+            "has_api_key": has_credential,
             "timeout": get_llm_timeout(),
             "temperature": config["temperature"],
             "ok": ok,
             "message": msg,
         }
         click.echo(json.dumps(result, indent=2))
-        sys.exit(0 if ok else 1)
 
-    click.echo()
-    click.echo(click.style("  LLM Configuration Check", fg="blue", bold=True))
-    click.echo(click.style("  " + "─" * 40, fg="blue"))
-    click.echo()
-    click.echo(f"    Provider:    {config['provider'] or '(not set)'}")
-    click.echo(f"    Model:       {config['model']}")
-    if config["provider"] == "alcf":
-        has_token = bool(os.environ.get("ALCF_ACCESS_TOKEN"))
-        click.echo(
-            f"    Token:       {'••••' + os.environ['ALCF_ACCESS_TOKEN'][-4:] if has_token else click.style('NOT SET', fg='red')}"
-        )
-        click.echo(f"    ALCF cluster: {config.get('alcf_cluster', 'sophia')}")
-    else:
-        click.echo(
-            f"    API key:     {'••••' + config['api_key'][-4:] if has_key else click.style('NOT SET', fg='red')}"
-        )
-    if config.get("base_url"):
-        click.echo(f"    Base URL:    {config['base_url']}")
-    click.echo(f"    Timeout:     {get_llm_timeout()}s")
-    click.echo(f"    Temperature: {config['temperature']}")
-    click.echo()
-
-    if not info["available"]:
-        click.echo(click.style("  ✗ LLM not available", fg="red", bold=True))
-        click.echo()
-        if config["provider"] == "alcf":
-            click.echo("    Authenticate with ALCF to obtain an access token:")
-            click.echo()
-            _show_alcf_auth_hint(offer_fix=fix)
-            click.echo()
-            click.echo("    Then set the token:")
-            click.echo("      export ALCF_ACCESS_TOKEN=<your-token>")
-        elif config["provider"] in ("openai", "gemini") and not has_key:
-            click.echo("    Set an API key:")
-            click.echo("      export LLM_API_KEY=<your-key>")
-            click.echo("    or add to .env:")
-            click.echo(f"      LLM_PROVIDER={config['provider']}")
-            click.echo("      LLM_API_KEY=<your-key>")
-        elif config["provider"] == "local" and not config.get("base_url"):
-            click.echo("    Set a base URL for local provider:")
-            click.echo("      export LLM_BASE_URL=http://localhost:11434/v1")
-        click.echo()
-        sys.exit(1)
-
-    if no_test:
-        click.echo(
-            click.style("  ✓ Credentials present (skipped live test)", fg="green")
-        )
-        click.echo()
-        return
-
-    click.echo("    Testing connection...", nl=False)
-    ok, msg = _check_llm_status(quiet=True, test_connection=True)
-    if ok:
-        click.echo(click.style(" ✓ Connected", fg="green"))
-    else:
-        click.echo(click.style(f" ✗ {msg}", fg="red"))
-        if config["provider"] == "alcf":
-            click.echo()
-            click.echo(
-                click.style(
-                    "    ALCF tokens expire periodically. Re-authenticate:", fg="yellow"
-                )
-            )
-            click.echo()
-            _show_alcf_auth_hint(offer_fix=fix)
-    click.echo()
     sys.exit(0 if ok else 1)
 
 

@@ -1,33 +1,37 @@
 """
 LLM provider registry.
 
-Each provider module exposes two functions:
+Supported providers: openai, gemini, alcf, local.
 
-* ``is_available(config) -> bool``  (optional – used for future probing)
-* ``create_llm(config, temperature) -> BaseChatModel``
+``openai``, ``alcf``, and ``local`` all use the OpenAI-compatible
+LangChain wrapper with different base URLs and credential handling.
+``gemini`` uses :class:`ChatGoogleGenerativeAI`.
 
-:func:`get_llm` reads the active provider from *config["provider"]* and
-dispatches to the right module.  Adding a new provider is as simple as
-dropping a new ``<name>.py`` in this package and registering it in
-``_PROVIDERS`` below.
+Adding a new OpenAI-compatible provider only requires a new factory in
+``openai_compat.py`` and a registry entry in :data:`PROVIDERS` below.
 """
+
+from __future__ import annotations
 
 from typing import Optional
 
 from ..config import get_llm_config
+from .alcf_auth import get_token  # noqa: F401  (re-exported for config.py)
+from .openai_compat import create_openai, create_alcf, create_local
+from .gemini import create_gemini
 
-# Lazy registry: provider name → module path (relative to this package)
-_PROVIDERS: dict[str, str] = {
-    "openai": ".openai",
-    "gemini": ".gemini",
-    "alcf": ".alcf",
-    "local": ".local",
+# ── Registry & public entry point ──────────────────────────────────────
+
+PROVIDERS = {
+    "openai": create_openai,
+    "gemini": create_gemini,
+    "alcf": create_alcf,
+    "local": create_local,
 }
 
 
 def get_llm(temperature: Optional[float] = None):
-    """
-    Return a configured LangChain chat model for the active provider.
+    """Return a configured LangChain chat model for the active provider.
 
     Args:
         temperature: Override the configured temperature.
@@ -41,18 +45,12 @@ def get_llm(temperature: Optional[float] = None):
     config = get_llm_config()
     provider = config["provider"]
 
-    module_path = _PROVIDERS.get(provider)
-    if module_path is None:
+    factory = PROVIDERS.get(provider)
+    if factory is None:
         raise ValueError(
             f"Unknown LLM provider '{provider}'. "
-            f"Supported: {', '.join(sorted(_PROVIDERS))}"
+            f"Supported: {', '.join(sorted(PROVIDERS))}"
         )
 
-    # Import the provider module lazily so we don't pull in heavy SDKs
-    # until they are actually needed.
-    import importlib
-
-    mod = importlib.import_module(module_path, package=__package__)
-
     temp = temperature if temperature is not None else config["temperature"]
-    return mod.create_llm(config, temp)
+    return factory(config, temp)

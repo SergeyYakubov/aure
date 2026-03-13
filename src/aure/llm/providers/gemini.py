@@ -1,7 +1,9 @@
 """Google Gemini provider."""
 
+from __future__ import annotations
 
-def create_llm(config: dict, temperature: float):
+
+def create_gemini(config: dict, temperature: float):
     """Create a ``ChatGoogleGenerativeAI`` instance."""
     from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -9,9 +11,9 @@ def create_llm(config: dict, temperature: float):
         raise ValueError(
             "LLM_API_KEY or GEMINI_API_KEY must be set for Gemini provider"
         )
-
-    # The google-genai SDK has built-in retries that we can't disable through
-    # langchain.  Use invoke_with_timeout() at call sites to cap runaway retries.
+    # The google-genai SDK has built-in retries that we can't disable
+    # through langchain.  Use invoke_with_timeout() at call sites to
+    # cap runaway retries.
     return ChatGoogleGenerativeAI(
         model=config["model"],
         temperature=temperature,

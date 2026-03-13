@@ -87,15 +87,15 @@ def _alcf_token_available(config: dict) -> bool:
     if os.environ.get("ALCF_ACCESS_TOKEN"):
         return True
     # Try to actually obtain a token (lazy methods may have cached one).
-    # Suppress noisy warnings that _get_token emits on each fallback path.
+    # Suppress noisy warnings that get_token emits on each fallback path.
     try:
-        from .providers.alcf import _get_token
+        from .providers import get_token
 
         alcf_logger = logging.getLogger("aure.llm.providers.alcf")
         old_level = alcf_logger.level
         alcf_logger.setLevel(logging.CRITICAL)
         try:
-            _get_token()
+            get_token()
             return True
         finally:
             alcf_logger.setLevel(old_level)
@@ -115,4 +115,10 @@ def get_llm_info() -> dict:
         info["base_url"] = config["base_url"]
     elif config["provider"] == "alcf":
         info["alcf_cluster"] = config["alcf_cluster"]
+        # Report the effective base URL that will actually be used
+        from .providers.openai_compat import ALCF_CLUSTER_PATHS
+
+        cluster = config.get("alcf_cluster") or "sophia"
+        path = ALCF_CLUSTER_PATHS.get(cluster, "")
+        info["base_url"] = f"https://inference-api.alcf.anl.gov{path}"
     return info
