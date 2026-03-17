@@ -14,6 +14,8 @@ import tempfile
 from typing import Dict, Any, Optional
 from pathlib import Path
 
+import numpy as np
+
 from ..state import ReflectivityState, FitResult, Message
 
 logger = logging.getLogger(__name__)
@@ -243,6 +245,25 @@ def _extract_bumps_results(
     # Read SLD profile from refl1d export if available
     sld_z, sld_rho = _read_profile_dat(export_dir)
 
+    # Compute residuals and residual ratio for fringe analysis
+    residuals = []
+    residual_ratio = []
+    if Q_fit and R_fit:
+        try:
+            R_data = problem.fitness.probe.R
+            dR_data = problem.fitness.probe.dR
+            R_fit_arr = np.array(R_fit)
+            if R_data is not None and len(R_data) == len(R_fit_arr):
+                # Normalized residuals: (data - model) / error
+                if dR_data is not None and len(dR_data) == len(R_data):
+                    safe_dR = np.maximum(np.abs(dR_data), 1e-20)
+                    residuals = ((R_data - R_fit_arr) / safe_dR).tolist()
+                # Ratio for fringe analysis: data / model
+                safe_R_fit = np.maximum(R_fit_arr, 1e-20)
+                residual_ratio = (R_data / safe_R_fit).tolist()
+        except Exception as e:
+            logger.debug(f"[FITTING] Could not compute residuals: {e}")
+
     return FitResult(
         iteration=iteration,
         method=method,
@@ -253,7 +274,8 @@ def _extract_bumps_results(
         bounds=param_bounds if param_bounds else None,
         Q_fit=Q_fit,
         R_fit=R_fit,
-        residuals=[],
+        residuals=residuals,
+        residual_ratio=residual_ratio,
         sld_z=sld_z,
         sld_rho=sld_rho,
         issues=[],

@@ -6,7 +6,7 @@ with known parameters, then tests if features can be recovered.
 """
 
 import numpy as np
-from aure.tools.feature_tools import extract_all_features
+from aure.tools.feature_tools import extract_all_features, analyze_residual_fringes
 from aure.database.materials import lookup_material
 
 
@@ -191,3 +191,92 @@ def test_material_lookup():
         assert abs(sld - expected) < 0.1, (
             f"SLD mismatch for {query}: got {sld:.3f}, expected {expected}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Residual Fringe Analysis Tests
+# ---------------------------------------------------------------------------
+
+
+def test_residual_fringes_from_missing_layer():
+    """
+    Simulate a model missing a thick (~2000 Å) layer.
+
+    Generate 'data' from a 2-layer system (Cu + Si overlayer on Si substrate)
+    and 'model' from a 1-layer system (Cu only on Si substrate).
+    The residual ratio R_data / R_model should show fringes from the
+    unmodeled Si overlayer, with detectable thickness ~2000 Å.
+    """
+    Q = np.linspace(0.008, 0.10, 600)
+
+    # "True" sample: Si substrate | Cu (200 Å) | Si overlayer (2000 Å) | air
+    R_data = _parratt(
+        Q,
+        sld=[0.0, 2.07, 6.55, 2.07],      # air, Si_over, Cu, Si_sub
+        thickness=[0.0, 2000.0, 200.0, 0.0],
+        roughness=[5.0, 5.0, 3.0],
+    )
+
+    # "Model" (missing the Si overlayer): Si substrate | Cu (200 Å) | air
+    R_model = _parratt(
+        Q,
+        sld=[0.0, 6.55, 2.07],             # air, Cu, Si_sub
+        thickness=[0.0, 200.0, 0.0],
+        roughness=[5.0, 3.0],
+    )
+
+    # Compute residual ratio
+    residual_ratio = R_data / np.maximum(R_model, 1e-20)
+
+    result = analyze_residual_fringes(Q, residual_ratio)
+
+    assert result["has_residual_fringes"], "Should detect residual fringes"
+    assert result["fringe_amplitude"] > 0.02, (
+        f"Fringe amplitude too low: {result['fringe_amplitude']}"
+    )
+    assert len(result["unmodeled_thicknesses"]) > 0, "Should find unmodeled thickness"
+
+    # At least one thickness should be close to 2000 Å (within 30%)
+    best_match = min(
+        result["unmodeled_thicknesses"],
+        key=lambda t: abs(t["thickness"] - 2000.0),
+    )
+    error_pct = abs(best_match["thickness"] - 2000.0) / 2000.0 * 100
+    assert error_pct < 30, (
+        f"Expected ~2000 Å, got {best_match['thickness']:.0f} Å "
+        f"(error: {error_pct:.1f}%)"
+    )
+
+
+def test_residual_flat_no_fringes():
+    """When model matches data well, no residual fringes should be detected."""
+    Q = np.linspace(0.01, 0.15, 400)
+
+    # Same model for both data and fit → ratio ≈ 1.0
+    R = _parratt(
+        Q,
+        sld=[0.0, 6.55, 2.07],
+        thickness=[0.0, 200.0, 0.0],
+        roughness=[5.0, 3.0],
+    )
+
+    # Add a tiny bit of noise
+    rng = np.random.default_rng(42)
+    residual_ratio = 1.0 + rng.normal(0, 0.005, len(Q))
+
+    result = analyze_residual_fringes(Q, residual_ratio)
+
+    assert not result["has_residual_fringes"], (
+        "Flat residual should not show fringes"
+    )
+
+
+def test_residual_short_data():
+    """Short data arrays should return empty result gracefully."""
+    Q = np.array([0.01, 0.02, 0.03])
+    ratio = np.array([1.0, 1.1, 0.9])
+
+    result = analyze_residual_fringes(Q, ratio)
+
+    assert not result["has_residual_fringes"]
+    assert result["unmodeled_thicknesses"] == []

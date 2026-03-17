@@ -544,6 +544,268 @@ def extract_all_features(
     }
 
 
+def analyze_residual_fringes(
+    Q: np.ndarray,
+    residual_ratio: np.ndarray,
+    q_min: float = 0.02,
+    q_max: float | None = None,
+    n_fft_points: int = 1024,
+) -> Dict:
+    """
+    Detect unmodeled layer thicknesses from oscillations in the residual ratio.
+
+    When R_data / R_fit oscillates around 1.0 with periodic structure, it
+    indicates the model is missing a layer whose thickness determines the
+    oscillation period via d ≈ 2π / ΔQ.
+
+    Args:
+        Q: Q values (Å⁻¹), same grid as residual_ratio
+        residual_ratio: R_data / R_fit array
+        q_min: Minimum Q to analyze (skip critical edge region)
+        q_max: Maximum Q (skip noisy high-Q tail); None = use all
+        n_fft_points: Number of FFT points
+
+    Returns:
+        Dict with:
+          - has_residual_fringes: bool
+          - unmodeled_thicknesses: list of {thickness, uncertainty, confidence, method}
+          - fringe_amplitude: float (RMS deviation from 1.0)
+          - n_residual_fringes: int
+    """
+    Q = np.asarray(Q, dtype=float)
+    residual_ratio = np.asarray(residual_ratio, dtype=float)
+
+    if len(Q) != len(residual_ratio) or len(Q) < 20:
+        return _empty_residual_result()
+
+    # Apply Q range filter
+    mask = Q >= q_min
+    if q_max is not None:
+        mask &= Q <= q_max
+    Q_sel = Q[mask]
+    ratio_sel = residual_ratio[mask]
+
+    if len(Q_sel) < 20:
+        return _empty_residual_result()
+
+    # Fringe amplitude: RMS deviation of ratio from 1.0
+    fringe_amplitude = float(np.sqrt(np.mean((ratio_sel - 1.0) ** 2)))
+
+    # If the residual is very flat, no fringes to find
+    if fringe_amplitude < 0.02:
+        return {
+            "has_residual_fringes": False,
+            "unmodeled_thicknesses": [],
+            "fringe_amplitude": fringe_amplitude,
+            "n_residual_fringes": 0,
+        }
+
+    thicknesses = []
+
+    # --- Method 1: FFT on the ratio signal ---
+    fft_thicknesses = _fft_residual_thicknesses(Q_sel, ratio_sel, n_fft_points)
+    thicknesses.extend(fft_thicknesses)
+
+    # --- Method 2: Direct fringe-spacing on the ratio signal ---
+    spacing_result = _fringe_spacing_residual(Q_sel, ratio_sel)
+    if spacing_result is not None:
+        thicknesses.append(spacing_result)
+
+    # Deduplicate: merge results within 20% of each other
+    thicknesses = _deduplicate_thicknesses(thicknesses)
+
+    n_fringes = max(
+        (t.get("n_fringes", 0) for t in thicknesses), default=0
+    )
+
+    return {
+        "has_residual_fringes": len(thicknesses) > 0,
+        "unmodeled_thicknesses": thicknesses,
+        "fringe_amplitude": fringe_amplitude,
+        "n_residual_fringes": n_fringes,
+    }
+
+
+def _empty_residual_result() -> Dict:
+    """Return an empty residual analysis result."""
+    return {
+        "has_residual_fringes": False,
+        "unmodeled_thicknesses": [],
+        "fringe_amplitude": 0.0,
+        "n_residual_fringes": 0,
+    }
+
+
+def _fft_residual_thicknesses(
+    Q: np.ndarray,
+    ratio: np.ndarray,
+    n_fft_points: int = 1024,
+) -> List[Dict]:
+    """Extract unmodeled thicknesses via FFT of the residual ratio signal."""
+    # Resample to uniform Q spacing
+    Q_uniform = np.linspace(Q.min(), Q.max(), n_fft_points)
+    ratio_uniform = np.interp(Q_uniform, Q, ratio)
+
+    # Polynomial detrending (order 3) to remove low-frequency model-mismatch
+    # envelope while preserving oscillatory fringe signal
+    coeffs = np.polyfit(Q_uniform, ratio_uniform, 3)
+    deviation = ratio_uniform - np.polyval(coeffs, Q_uniform)
+
+    # Apply Hanning window
+    window = np.hanning(len(deviation))
+    deviation_windowed = deviation * window
+
+    # FFT
+    fft_vals = np.fft.rfft(deviation_windowed)
+    freqs = np.fft.rfftfreq(len(Q_uniform), Q_uniform[1] - Q_uniform[0])
+    power = np.abs(fft_vals) ** 2
+
+    # Skip frequencies below the minimum detectable: require at least
+    # min_fringes complete oscillations visible in the Q range
+    Q_range = Q.max() - Q.min()
+    min_fringes = 5
+    min_thickness = min_fringes * 2.0 * np.pi / Q_range
+    freq_step = freqs[1] - freqs[0] if len(freqs) > 1 else 1.0
+    min_freq_idx = max(3, int((min_thickness / (2.0 * np.pi)) / (freq_step + 1e-30)))
+    if min_freq_idx >= len(power):
+        return []
+
+    power_search = power[min_freq_idx:]
+    if len(power_search) < 3 or np.max(power_search) == 0:
+        return []
+
+    peaks, properties = find_peaks(
+        power_search,
+        prominence=0.05 * np.max(power_search),
+        distance=2,
+    )
+
+    results = []
+    for peak in peaks:
+        idx = peak + min_freq_idx
+        freq = freqs[idx]
+        if freq <= 0:
+            continue
+        # freq from rfftfreq is in cycles per Å⁻¹ (units of Å)
+        # Kiessig: thickness = 2π / ΔQ, and ΔQ = 1/freq → thickness = 2π * freq
+        thickness_angstrom = 2.0 * np.pi * freq
+
+        if thickness_angstrom < 50:  # unphysically thin
+            continue
+
+        results.append({
+            "thickness": float(thickness_angstrom),
+            "uncertainty": float(thickness_angstrom * 0.15),
+            "confidence": "medium",
+            "method": "residual_fft",
+            "fft_power": float(power[idx]),
+        })
+
+    # Sort by FFT power (most significant first), keep top 5
+    results.sort(key=lambda x: x.get("fft_power", 0), reverse=True)
+    return results[:5]
+
+
+def _fringe_spacing_residual(Q: np.ndarray, ratio: np.ndarray) -> Optional[Dict]:
+    """Extract dominant unmodeled thickness via fringe-spacing on the ratio."""
+    if len(ratio) < 20:
+        return None
+
+    # Polynomial detrending to remove low-frequency model-mismatch envelope
+    coeffs = np.polyfit(Q, ratio, 3)
+    deviation = ratio - np.polyval(coeffs, Q)
+
+    # Use a small smoothing window to preserve closely-spaced fringes
+    # (thick layers produce fringes spaced only a few data points apart)
+    window = min(5, len(deviation) // 10)
+    if window < 3:
+        window = 3
+    if window % 2 == 0:
+        window += 1
+    smooth = savgol_filter(deviation, window, 2)
+
+    # Find minima of the smoothed deviation (troughs in ratio)
+    # Use a low prominence threshold relative to the MAD (median absolute
+    # deviation) to detect small fringes masked by residual envelope
+    mad = np.median(np.abs(smooth - np.median(smooth)))
+    if mad < 0.005:
+        return None
+    prominence = max(0.5 * mad, 0.01)
+
+    minima, _ = find_peaks(-smooth, distance=3, prominence=prominence)
+
+    if len(minima) < 3:
+        return None
+
+    delta_Q = np.diff(Q[minima])
+    # Use median spacing (robust to outlier spacings from false minima)
+    median_delta_Q = float(np.median(delta_Q))
+    if median_delta_Q <= 0:
+        return None
+
+    thickness = 2.0 * np.pi / median_delta_Q
+    n_fringes = len(minima)
+
+    # Uncertainty from spread in fringe spacings
+    if len(delta_Q) > 1:
+        # Use MAD of spacings for robust uncertainty
+        spacing_mad = np.median(np.abs(delta_Q - median_delta_Q))
+        uncertainty = thickness * (spacing_mad / median_delta_Q) if median_delta_Q > 0 else thickness * 0.2
+    else:
+        uncertainty = thickness * 0.2
+
+    # Confidence
+    if n_fringes >= 5 and len(delta_Q) > 1 and np.std(delta_Q) / median_delta_Q < 0.3:
+        confidence = "high"
+    elif n_fringes >= 3:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return {
+        "thickness": float(thickness),
+        "uncertainty": float(uncertainty),
+        "confidence": confidence,
+        "method": "residual_fringe_spacing",
+        "n_fringes": n_fringes,
+    }
+
+
+def _deduplicate_thicknesses(thicknesses: List[Dict]) -> List[Dict]:
+    """Merge thickness estimates within 20% of each other, keeping the highest confidence."""
+    if not thicknesses:
+        return []
+
+    confidence_rank = {"high": 3, "medium": 2, "low": 1}
+    # Sort by confidence (best first), then by FFT power / n_fringes (highest first)
+    thicknesses.sort(
+        key=lambda t: (
+            -confidence_rank.get(t.get("confidence", "low"), 0),
+            -t.get("fft_power", 0),
+            -t.get("n_fringes", 0),
+        )
+    )
+
+    merged = []
+    for t in thicknesses:
+        found_match = False
+        for m in merged:
+            if abs(t["thickness"] - m["thickness"]) / max(m["thickness"], 1) < 0.2:
+                # Keep the higher-confidence estimate
+                if confidence_rank.get(t.get("confidence"), 0) > confidence_rank.get(m.get("confidence"), 0):
+                    m.update(t)
+                found_match = True
+                break
+        if not found_match:
+            merged.append(dict(t))
+
+    # Remove internal fft_power key from results
+    for m in merged:
+        m.pop("fft_power", None)
+
+    return merged
+
+
 def format_features_for_llm(features: Dict) -> str:
     """
     Format extracted features as human-readable text for LLM context.

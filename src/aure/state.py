@@ -97,6 +97,7 @@ class FitResult(TypedDict):
     Q_fit: List[float]
     R_fit: List[float]
     residuals: List[float]
+    residual_ratio: List[float]  # R_data / R_fit for fringe analysis
 
     # SLD profile (from refl1d output)
     sld_z: Optional[List[float]]

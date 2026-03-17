@@ -160,6 +160,9 @@ FIT_EVALUATION_PROMPT = """You are evaluating the results of a neutron reflectiv
 ## Extracted Data Features
 {features}
 
+## Residual Fringe Analysis
+{residual_analysis}
+
 ## Task
 Analyze the fit quality and determine:
 1. Is this fit acceptable for the user's goals?
@@ -219,6 +222,38 @@ IMPORTANT CONSTRAINTS:
 """
 
 
+def _format_residual_analysis(residual_analysis: Dict[str, Any] | None) -> str:
+    """Format residual fringe analysis results for LLM prompts."""
+    if not residual_analysis or not residual_analysis.get("has_residual_fringes"):
+        return "  (no structured residual oscillations detected)"
+
+    lines = []
+    amp = residual_analysis.get("fringe_amplitude", 0)
+    lines.append(f"  - Residual fringe amplitude (RMS): {amp:.3f}")
+    lines.append(
+        f"  - Number of residual fringes: {residual_analysis.get('n_residual_fringes', 0)}"
+    )
+
+    for i, t in enumerate(residual_analysis.get("unmodeled_thicknesses", [])):
+        thick = t["thickness"]
+        unc = t.get("uncertainty", thick * 0.2)
+        conf = t.get("confidence", "low")
+        method = t.get("method", "unknown")
+        lines.append(
+            f"  - **Unmodeled thickness {i + 1}**: ~{thick:.0f} ± {unc:.0f} Å "
+            f"({conf} confidence, {method})"
+        )
+
+    lines.append("")
+    lines.append(
+        "  The residual (R_data / R_fit) shows periodic oscillations that the "
+        "current model does not explain. These fringes indicate one or more "
+        "layers are missing from the model. Consider adding a layer with the "
+        "detected thickness."
+    )
+    return "\n".join(lines)
+
+
 def format_fit_evaluation_prompt(
     sample_description: str,
     hypothesis: str | None,
@@ -229,6 +264,7 @@ def format_fit_evaluation_prompt(
     features: Dict[str, Any],
     chi2_max: float = 5.0,
     user_criteria: str = "",
+    residual_analysis: Dict[str, Any] | None = None,
 ) -> str:
     """
     Format the fit evaluation prompt.
@@ -287,6 +323,7 @@ def format_fit_evaluation_prompt(
         features=features_str,
         chi2_max=chi2_max,
         user_criteria=user_criteria,
+        residual_analysis=_format_residual_analysis(residual_analysis),
     )
 
 
@@ -320,6 +357,9 @@ MODEL_REFINEMENT_PROMPT = """You are refining a neutron reflectivity model (refl
 
 ## Physics Features from Data
 {features}
+
+## Residual Fringe Analysis
+{residual_analysis}
 
 ## Task
 Generate an IMPROVED refl1d model script that addresses the issues above.
@@ -462,6 +502,9 @@ def format_model_refinement_prompt(
             suggestions=suggestions_str,
             features=features_str,
             user_constraints=user_constraints,
+            residual_analysis=_format_residual_analysis(
+                fit_result.get("residual_analysis")
+            ),
         )
         + feedback_section
     )

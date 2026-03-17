@@ -15,6 +15,7 @@ import re
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
+import numpy as np
 from langchain_core.messages import HumanMessage
 
 from ..state import ReflectivityState, FitResult, Message, LLMCallRecord
@@ -63,6 +64,29 @@ def evaluation_node(state: ReflectivityState) -> Dict[str, Any]:
     chi2 = latest_fit.get("chi_squared", float("inf"))
     logger.info(f"[EVALUATION] Current χ² = {chi2:.3f}")
 
+    # ========== Residual Fringe Analysis ==========
+    # When the fit is not great, look for unmodeled oscillations in the
+    # residual that reveal missing layer thicknesses.
+    chi2_max = _get_chi2_max()
+    residual_ratio = latest_fit.get("residual_ratio", [])
+    Q = state.get("Q", [])
+    if residual_ratio and Q and chi2 > chi2_max:
+        try:
+            from ..tools.feature_tools import analyze_residual_fringes
+
+            residual_analysis = analyze_residual_fringes(
+                np.array(Q), np.array(residual_ratio),
+            )
+            latest_fit["residual_analysis"] = residual_analysis
+            if residual_analysis.get("has_residual_fringes"):
+                for t in residual_analysis["unmodeled_thicknesses"]:
+                    logger.info(
+                        f"[EVALUATION] Residual fringes suggest unmodeled "
+                        f"layer ~{t['thickness']:.0f} Å ({t['confidence']} confidence)"
+                    )
+        except Exception as e:
+            logger.debug(f"[EVALUATION] Residual fringe analysis failed: {e}")
+
     # ========== Analyze Fit Quality ==========
     if not llm_available():
         updates["error"] = (
@@ -70,7 +94,6 @@ def evaluation_node(state: ReflectivityState) -> Dict[str, Any]:
         )
         return updates
 
-    chi2_max = _get_chi2_max()
     user_criteria = format_user_criteria(state.get("user_config"))
     try:
         analysis = analyze_fit_quality_with_llm(
@@ -80,6 +103,7 @@ def evaluation_node(state: ReflectivityState) -> Dict[str, Any]:
             features=state.get("extracted_features"),
             chi2_max=chi2_max,
             user_criteria=user_criteria,
+            residual_analysis=latest_fit.get("residual_analysis"),
         )
         used_fallback = analysis.pop("_used_fallback", False)
         updates["llm_calls"].append(
@@ -179,6 +203,7 @@ def analyze_fit_quality_with_llm(
     features: Optional[Dict],
     chi2_max: float = 5.0,
     user_criteria: str = "",
+    residual_analysis: Optional[Dict] = None,
 ) -> Dict[str, Any]:
     """
     Use LLM to analyze fit quality in context.
@@ -198,6 +223,7 @@ def analyze_fit_quality_with_llm(
         features=features or {},
         chi2_max=chi2_max,
         user_criteria=user_criteria,
+        residual_analysis=residual_analysis,
     )
 
     response = llm.invoke([HumanMessage(content=prompt)])
