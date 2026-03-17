@@ -62,8 +62,11 @@ class RunData:
         if self._final_state is None:
             path = self.output_dir / "final_state.json"
             if path.exists():
-                data = json.loads(path.read_text())
-                self._final_state = data.get("state", data)
+                data = json.loads(path.read_text(encoding="utf-8"))
+                state = data.get("state", data)
+                # Rejoin message content arrays written for readability
+                _rejoin_message_content(state)
+                self._final_state = state
             else:
                 # Fall back to the latest checkpoint
                 self._final_state = self._load_latest_checkpoint_state()
@@ -219,6 +222,30 @@ class RunData:
         return {"Q": Q, "R": R, "dR": dR, "models": models, "best_iteration": best_iteration}
 
     # ------------------------------------------------------------------
+    # Model-per-iteration lookup
+    # ------------------------------------------------------------------
+
+    def _get_model_for_iteration(self, iteration: int) -> object | None:
+        """Return the model definition that was used for a given fit iteration.
+
+        Looks up ``model_history`` first (keyed by iteration number).
+        Falls back to ``current_model`` when history is unavailable.
+        """
+        state = self.get_final_state()
+        model_history = state.get("model_history") or []
+        for entry in model_history:
+            if entry.get("iteration") == iteration:
+                defn = entry.get("definition")
+                if defn and isinstance(defn, dict):
+                    return defn
+                # Legacy script path
+                script = entry.get("script")
+                if script:
+                    return script
+        # Fallback: current model (best we can do)
+        return state.get("current_model")
+
+    # ------------------------------------------------------------------
     # SLD profiles  (requires refl1d model execution)
     # ------------------------------------------------------------------
 
@@ -236,13 +263,7 @@ class RunData:
         if self._sld_cache is not None:
             return self._sld_cache
 
-        models_dir = self.output_dir / "models"
-        if not models_dir.exists():
-            self._sld_cache = {"profiles": []}
-            return self._sld_cache
-
         state = self.get_final_state()
-        Q_data = np.array(state.get("Q", []))
         fit_results = state.get("fit_results", [])
 
         profiles: List[dict] = []
@@ -251,31 +272,26 @@ class RunData:
             iteration = fr.get("iteration", idx)
             chi2 = fr.get("chi_squared")
 
-            # Build the same label used by get_reflectivity_data()
             label = f"Iteration {iteration}"
             if chi2 is not None:
                 label += f" (χ²={chi2:.2f})"
 
-            # Find the corresponding model file
-            model_file = models_dir / f"model_fitting_iter{iteration}.py"
-            if not model_file.exists():
-                logger.debug("No model file for iteration %d", iteration)
-                continue
+            fitted_params = fr.get("parameters", {})
+            model = self._get_model_for_iteration(iteration)
 
             try:
-                fitted_params = fr.get("parameters", {})
-                result = _execute_model_file(
-                    model_file,
-                    Q_data,
-                    working_dir=self.output_dir.parent,
-                    fitted_parameters=fitted_params,
+                result = _compute_sld_from_model(
+                    model,
+                    fitted_params,
+                    output_dir=self.output_dir,
+                    iteration=iteration,
                 )
                 if result and result.get("z") is not None:
                     profiles.append(
                         {"label": label, "z": result["z"], "sld": result["sld"]}
                     )
             except Exception as exc:
-                logger.debug("Could not execute model %s: %s", model_file.name, exc)
+                logger.debug("Could not compute SLD for iteration %d: %s", iteration, exc)
 
         self._sld_cache = {"profiles": profiles}
         return self._sld_cache
@@ -334,7 +350,11 @@ class RunData:
         uncertainties = selected.get("uncertainties") or {}
         bounds = selected.get("bounds") or {}
 
-        # Fallback: read bounds from problem.json when not stored in state
+        # Fallback: read bounds from model definition or problem.json
+        if not bounds:
+            iter_num = selected.get("iteration", idx)
+            iter_model = self._get_model_for_iteration(iter_num)
+            bounds = self._read_bounds_from_model_definition(iter_model)
         if not bounds:
             bounds = self._read_bounds_from_problem_json()
 
@@ -357,6 +377,48 @@ class RunData:
             "best_iteration": best_idx,
             "parameters": rows,
         }
+
+    def _read_bounds_from_model_definition(
+        self, model: object | None = None,
+    ) -> dict:
+        """Extract parameter bounds from a ModelDefinition dict.
+
+        Parameters
+        ----------
+        model
+            A ``ModelDefinition`` dict.  When *None*, falls back to
+            ``current_model`` from the final state.
+
+        Returns ``{param_name: [lo, hi]}`` for parameters with defined ranges.
+        """
+        if model is None:
+            state = self.get_final_state()
+            model = state.get("current_model")
+        if not isinstance(model, dict):
+            return {}
+
+        bounds: dict = {}
+        for layer in model.get("layers", []):
+            name = layer.get("name", "unknown")
+            for prop in ("sld", "thickness", "roughness"):
+                lo_key = f"{prop}_min"
+                hi_key = f"{prop}_max"
+                lo = layer.get(lo_key)
+                hi = layer.get(hi_key)
+                val = layer.get(prop)
+                if lo is not None and hi is not None:
+                    bounds[f"{name} {prop}"] = [lo, hi]
+                elif val is not None:
+                    # fixed parameter – no bounds
+                    pass
+        # Substrate roughness
+        sub = model.get("substrate", {})
+        sub_name = sub.get("name", "substrate")
+        r_max = sub.get("roughness_max")
+        r_val = sub.get("roughness", 0)
+        if r_max is not None:
+            bounds[f"{sub_name} interface"] = [0, r_max]
+        return bounds
 
     def _read_bounds_from_problem_json(self) -> dict:
         """Extract parameter bounds from the persisted ``problem.json``.
@@ -394,57 +456,49 @@ class RunData:
     # ------------------------------------------------------------------
 
     def simulate(
-        self, parameters: Dict[str, float], *, bounds: Optional[Dict[str, list]] = None
+        self,
+        parameters: Dict[str, float],
+        *,
+        bounds: Optional[Dict[str, list]] = None,
+        iteration: int | None = None,
     ) -> dict:
         """Compute reflectivity, SLD, and chi² for user-specified parameters.
 
-        Uses the latest fitting model script from disk, applies the given
-        parameter values, then computes curves via refl1d.
+        Builds a model from the ModelDefinition (or legacy script) and applies
+        the given parameter values, then computes curves via refl1d.
 
         Parameters
         ----------
         bounds
             Optional ``{name: [lo, hi]}`` overrides coming from the UI.
-            When present, model parameter bounds are widened to these
-            ranges before values are assigned so that chi² reflects only
-            data misfit rather than artificial bound penalties.
+        iteration
+            Fit iteration whose model structure to use.  When *None*,
+            falls back to the current (latest) model.
 
         Returns ``{"Q_fit", "R_fit", "sld_z", "sld_rho", "chi_squared"}``.
         """
-        state = self.get_final_state()
-        models_dir = self.output_dir / "models"
+        if iteration is not None:
+            model = self._get_model_for_iteration(iteration)
+        else:
+            state = self.get_final_state()
+            model = state.get("current_model")
 
-        # Find the latest model file that has .range() constraints
-        fit_results = state.get("fit_results", [])
-        model_file = None
-        for fr in reversed(fit_results):
-            iteration = fr.get("iteration", 0)
-            candidate = models_dir / f"model_fitting_iter{iteration}.py"
-            if candidate.exists():
-                model_file = candidate
-                break
-        # Fallback to model_final.py
-        if model_file is None:
-            model_file = models_dir / "model_final.py"
-        if not model_file.exists():
-            return {"error": "No model file found"}
-
-        Q_data = np.array(state.get("Q", []))
+        if model is None:
+            return {"error": "No model available"}
 
         try:
-            result = _execute_model_file(
-                model_file,
-                Q_data,
-                working_dir=self.output_dir.parent,
-                fitted_parameters=parameters,
-                parameter_bounds=bounds,
+            result = _compute_from_model(
+                model,
+                parameters,
+                bounds=bounds,
+                output_dir=self.output_dir,
                 compute_reflectivity=True,
             )
         except Exception as exc:
             return {"error": str(exc)}
 
         if result is None:
-            return {"error": "Model execution returned no result"}
+            return {"error": "Model computation returned no result"}
 
         return {
             "Q_fit": result.get("Q_fit") or [],
@@ -453,6 +507,133 @@ class RunData:
             "sld_rho": result.get("sld") or [],
             "chi_squared": result.get("chi_squared"),
         }
+
+
+# ======================================================================
+# JSON helpers
+# ======================================================================
+
+
+def _rejoin_message_content(data: object) -> None:
+    """Rejoin message ``content`` line-arrays back into strings (in-place).
+
+    Checkpoint files split multi-line content into JSON arrays for
+    readability.  This reverses that transformation on load.
+    """
+    if isinstance(data, dict):
+        if "role" in data and "content" in data and isinstance(data["content"], list):
+            data["content"] = "\n".join(data["content"])
+        for v in data.values():
+            _rejoin_message_content(v)
+    elif isinstance(data, list):
+        for item in data:
+            _rejoin_message_content(item)
+
+
+# ======================================================================
+# Model computation helpers (JSON ModelDefinition path)
+# ======================================================================
+
+
+def _compute_sld_from_model(
+    model: object,
+    fitted_params: Dict[str, float],
+    output_dir: Path,
+    iteration: int,
+) -> Optional[Dict[str, Any]]:
+    """Compute SLD profile from a model (dict or legacy script).
+
+    Thin convenience wrapper: delegates to ``_compute_from_model`` with
+    ``compute_reflectivity=False``.
+    """
+    return _compute_from_model(
+        model, fitted_params, output_dir=output_dir, compute_reflectivity=False
+    )
+
+
+def _compute_from_model(
+    model: object,
+    parameters: Dict[str, float],
+    *,
+    bounds: Optional[Dict[str, list]] = None,
+    output_dir: Optional[Path] = None,
+    compute_reflectivity: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Build a model, apply parameters, and extract curves.
+
+    Handles both new JSON ``ModelDefinition`` dicts and legacy script
+    strings.  For dicts the model is built via ``model_builder``; for
+    strings the old ``_execute_model_file`` code-path is used.
+
+    Returns a dict with keys ``z``, ``sld``, and optionally ``Q_fit``,
+    ``R_fit``, ``chi_squared``.
+    """
+    from aure.nodes.model_builder import (
+        apply_bounds,
+        apply_parameters,
+        build_problem,
+        is_legacy_script,
+    )
+
+    if is_legacy_script(model):
+        # Legacy: find a model file on disk and exec() it
+        if output_dir is None:
+            return None
+        models_dir = output_dir / "models"
+        model_file = models_dir / "model_final.py"
+        if not model_file.exists():
+            return None
+        Q_data = np.array([])  # not needed for SLD-only
+        return _execute_model_file(
+            model_file,
+            Q_data,
+            working_dir=output_dir.parent,
+            fitted_parameters=parameters or None,
+            parameter_bounds=bounds,
+            compute_reflectivity=compute_reflectivity,
+        )
+
+    # New JSON ModelDefinition path
+    definition = dict(model)  # type: ignore[arg-type]
+    problem = build_problem(definition)
+
+    if bounds:
+        apply_bounds(problem, bounds)
+    if parameters:
+        apply_parameters(problem, parameters)
+
+    experiment = problem.fitness
+    if hasattr(experiment, "_models"):
+        experiment = experiment._models[0]
+
+    result: Dict[str, Any] = {}
+
+    # SLD profile
+    try:
+        z_arr, sld_arr, _ = experiment.smooth_profile(dz=1.0)
+        result["z"] = np.array(z_arr).tolist()
+        result["sld"] = np.array(sld_arr).tolist()
+    except Exception:
+        result["z"] = None
+        result["sld"] = None
+
+    # Reflectivity + chi² (optional)
+    if compute_reflectivity:
+        try:
+            experiment.update()
+            Q_arr, R_arr = experiment.reflectivity()
+            result["Q_fit"] = np.array(Q_arr).tolist()
+            result["R_fit"] = np.array(R_arr).tolist()
+        except Exception:
+            result["Q_fit"] = None
+            result["R_fit"] = None
+        try:
+            chi2 = float(problem.chisq())
+            result["chi_squared"] = chi2 if math.isfinite(chi2) else None
+        except Exception:
+            result["chi_squared"] = None
+
+    return result
 
 
 # ======================================================================

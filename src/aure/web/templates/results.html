@@ -42,6 +42,9 @@
         <button id="btn-reset-params" class="btn btn-outline-secondary btn-sm d-none" onclick="resetParameters()">
           <i class="bi bi-arrow-counterclockwise"></i> Reset
         </button>
+        <button id="btn-refit" class="btn btn-primary btn-sm d-none ms-1" onclick="refitAnalysis()">
+          <i class="bi bi-play-fill"></i> Refit
+        </button>
       </div>
       <div class="card-body p-0">
         <div class="table-responsive">
@@ -125,6 +128,14 @@
             <label class="form-check-label" for="restart-modeling">
               <strong>Re-model &amp; re-fit</strong>
               <span class="text-muted">— rebuild the model with new guidance and re-fit</span>
+            </label>
+          </div>
+          <div class="form-check">
+            <input class="form-check-input" type="radio" name="restart-from"
+                   id="restart-fitting" value="fitting" />
+            <label class="form-check-label" for="restart-fitting">
+              <strong>Re-fit only</strong>
+              <span class="text-muted">— skip the LLM and fit directly with your parameters</span>
             </label>
           </div>
           <div class="form-check">
@@ -235,16 +246,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Populate restart checkpoint dropdown from workflow steps
   const sel = document.getElementById("restart-checkpoint");
   if (sel && chi2Data && chi2Data.length) {
-    const seen = {};
     chi2Data.forEach((d) => {
       if (d.node !== "evaluation") return;
-      const iter = d.iteration;
-      if (seen[iter]) return;
-      seen[iter] = true;
       const chi2Label = d.chi2 != null ? ` (χ²=${d.chi2.toFixed(2)})` : "";
       const opt = document.createElement("option");
-      opt.value = String(iter);
-      opt.textContent = `Iteration ${iter}${chi2Label}`;
+      opt.value = String(d.step);
+      opt.textContent = `Iteration ${d.iteration}${chi2Label}`;
       sel.appendChild(opt);
     });
   }
@@ -457,6 +464,7 @@ async function onIterationChange(value) {
     tbody.innerHTML = "";
     _userModified = false;
     document.getElementById("btn-reset-params").classList.add("d-none");
+    document.getElementById("btn-refit").classList.add("d-none");
     document.getElementById("sim-chi2").classList.add("d-none");
     _removeUserTraces("rq-chart");
     _removeUserTraces("sld-chart");
@@ -530,6 +538,7 @@ function onBoundChange(e) {
 function _markModified() {
   _userModified = true;
   document.getElementById("btn-reset-params").classList.remove("d-none");
+  document.getElementById("btn-refit").classList.remove("d-none");
 }
 
 /* ------------------------------------------------------------------ */
@@ -551,6 +560,7 @@ function resetParameters() {
   }
   _userModified = false;
   document.getElementById("btn-reset-params").classList.add("d-none");
+  document.getElementById("btn-refit").classList.add("d-none");
   document.getElementById("sim-chi2").classList.add("d-none");
 
   // Remove "User" traces from charts
@@ -596,7 +606,7 @@ async function _runSimulation() {
     const resp = await fetch("/api/simulate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ parameters: params, bounds: bounds }),
+      body: JSON.stringify({ parameters: params, bounds: bounds, iteration: _selectedIteration }),
     });
     const data = await resp.json();
     if (data.error) {
@@ -673,18 +683,60 @@ function getParameterOverrides() {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Refit with user parameters (shortcut)                             */
+/* ------------------------------------------------------------------ */
+async function refitAnalysis() {
+  if (!_userModified) {
+    alert("Adjust parameters or bounds first, then click Refit.");
+    return;
+  }
+  const payload = {
+    restart_from: "fitting",
+    insight: "",
+    ...getParameterOverrides(),
+  };
+  const dreamStepsEl = document.getElementById("restart-dream-steps");
+  if (dreamStepsEl && dreamStepsEl.value) {
+    payload.dream_steps = parseInt(dreamStepsEl.value, 10);
+  }
+  const btn = document.getElementById("btn-refit");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+  try {
+    const resp = await fetch("/api/restart-analysis", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      alert(data.error || data.errors?.join(", ") || "Refit failed");
+      btn.disabled = false;
+      btn.innerHTML = '<i class="bi bi-play-fill"></i> Refit';
+      return;
+    }
+    document.getElementById("restart-section").classList.add("d-none");
+    document.getElementById("restart-progress").classList.remove("d-none");
+    pollRestartStatus();
+  } catch (err) {
+    alert("Network error: " + err.message);
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-play-fill"></i> Refit';
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Restart analysis                                                  */
 /* ------------------------------------------------------------------ */
 async function restartAnalysis() {
-  const insight = document.getElementById("restart-insight").value.trim();
-  if (!insight) {
-    alert("Please describe what you'd like to change before restarting.");
-    return;
-  }
   const restartFrom = document.querySelector(
     'input[name="restart-from"]:checked'
   ).value;
-
+  const insight = document.getElementById("restart-insight").value.trim();
+  if (!insight && restartFrom !== "fitting") {
+    alert("Please describe what you'd like to change before restarting.");
+    return;
+  }
   const btn = document.getElementById("btn-restart");
   btn.disabled = true;
   btn.innerHTML =
@@ -702,7 +754,7 @@ async function restartAnalysis() {
   }
   const checkpointEl = document.getElementById("restart-checkpoint");
   if (checkpointEl && checkpointEl.value) {
-    payload.checkpoint_iteration = parseInt(checkpointEl.value, 10);
+    payload.checkpoint_step = parseInt(checkpointEl.value, 10);
   }
 
   try {

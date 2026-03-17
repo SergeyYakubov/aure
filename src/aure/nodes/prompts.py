@@ -508,3 +508,217 @@ def format_model_refinement_prompt(
         )
         + feedback_section
     )
+
+
+# ============================================================================
+# MODEL REFINEMENT — JSON-based  (new)
+# ============================================================================
+
+MODEL_REFINEMENT_JSON_PROMPT = """You are refining a neutron reflectivity model that did not fit well enough.
+
+## Sample Description
+{sample_description}
+
+## Current Model (JSON)
+```json
+{current_model_json}
+```
+
+## Fit Results
+- χ² (chi-squared): {chi_squared:.3f}
+- Method: {method}
+- Converged: {converged}
+
+## Best-fit Parameters (from fitting)
+{parameters}
+
+## Issues Identified
+{issues}
+
+## Suggestions for Improvement
+{suggestions}
+
+## Physics Features from Data
+{features}
+
+## Residual Fringe Analysis
+{residual_analysis}
+
+## Task
+Generate an IMPROVED model definition that addresses the issues above.
+You must output a COMPLETE, valid JSON object matching this schema:
+
+```json
+{{
+  "substrate": {{
+    "name": "material name",
+    "sld": <SLD value>,
+    "roughness": <roughness Å>,
+    "roughness_max": <max roughness Å>
+  }},
+  "layers": [
+    {{
+      "name": "material name",
+      "sld": <SLD value>,
+      "sld_min": <minimum SLD>,
+      "sld_max": <maximum SLD>,
+      "thickness": <thickness Å>,
+      "thickness_min": <min thickness Å>,
+      "thickness_max": <max thickness Å>,
+      "roughness": <roughness Å>,
+      "roughness_max": <max roughness Å>
+    }}
+  ],
+  "ambient": {{
+    "name": "material name",
+    "sld": <SLD value>
+  }},
+  "constraints": ["list of constraints"],
+  "back_reflection": <true/false>,
+  "data_file": "{data_file}",
+  "intensity": {{
+    "value": <starting intensity>,
+    "min": <min intensity>,
+    "max": <max intensity>,
+    "fixed": <true/false>
+  }}
+}}
+```
+
+Layers are listed from substrate to ambient (closest to substrate first).
+
+Rules:
+1. NEVER change data_file or back_reflection — these are set by the experiment.
+2. You may add layers, remove layers, change materials, adjust SLD values, or change parameter bounds.
+3. If parameters are hitting their bounds, widen those bounds (sld_min/sld_max, thickness_min/thickness_max).
+4. If there are systematic residuals, consider adding a layer.
+5. Use best-fit parameter values as starting points where physically reasonable.
+6. Unless the data is stated as perfectly normalized, keep intensity varying (fixed: false).
+7. Use SLD ranges of at least ±1.0 around nominal values.
+8. Avoid adding SiO₂ on silicon substrate unless user requests it.
+9. If a metal layer is directly in contact with the ambient and no oxide is present,
+   you MAY add a thin native oxide layer (10–30 Å).  Do NOT add oxides on buried layers.
+10. When adding a new layer, use physically reasonable thicknesses:
+    - SEI / organic layers: 50–200 Å (range: 5–500 Å)
+    - Metal oxide layers: 10–50 Å (range: 5–200 Å)
+    - Metallic plating: 10–100 Å (range: 5–300 Å)
+    NEVER add a layer with thickness < 5 Å.
+11. Unless requested by user, keep substrate SLD fixed (do not change its value).
+12. Do NOT split existing layers into sublayers unless χ² > 10 with clear evidence.
+
+{user_constraints}
+
+IMPORTANT: If user feedback is provided below, it takes absolute priority over
+any of the rules above.
+
+Output ONLY the JSON object, no markdown fences, no explanation.
+"""
+
+
+def format_model_refinement_prompt_json(
+    current_model: dict,
+    sample_description: str,
+    fit_result: dict,
+    features: dict,
+    user_constraints: str = "",
+    user_feedback: str | None = None,
+) -> str:
+    """Format the JSON-based model refinement prompt for the LLM.
+
+    Parameters
+    ----------
+    current_model
+        A ``ModelDefinition`` dict.
+    sample_description
+        Original sample description from user.
+    fit_result
+        Latest fit result dict.
+    features
+        Extracted physics features.
+    user_constraints
+        Formatted user-defined model constraints.
+    user_feedback
+        Optional text feedback from the interactive user session.
+
+    Returns
+    -------
+    str
+        Formatted prompt string ready for LLM invocation.
+    """
+    import json
+
+    # Format parameters
+    params = fit_result.get("parameters", {})
+    param_lines = [f"  - {name}: {value:.4f}" for name, value in params.items()]
+    params_str = "\n".join(param_lines) if param_lines else "  (no parameters)"
+
+    # Format issues
+    issues = fit_result.get("issues", [])
+    issues_str = "\n".join(f"  - {issue}" for issue in issues) if issues else "  (none)"
+
+    # Format suggestions
+    suggestions = fit_result.get("suggestions", [])
+    suggestions_str = (
+        "\n".join(f"  - {s}" for s in suggestions) if suggestions else "  (none)"
+    )
+
+    # Format features
+    feature_lines = []
+    if features:
+        if features.get("estimated_total_thickness"):
+            feature_lines.append(
+                f"  - Estimated thickness: {features['estimated_total_thickness']:.1f} Å"
+            )
+        if features.get("estimated_roughness"):
+            feature_lines.append(
+                f"  - Estimated roughness: {features['estimated_roughness']:.1f} Å"
+            )
+        if features.get("estimated_n_layers"):
+            feature_lines.append(
+                f"  - Estimated layers: {features['estimated_n_layers']}"
+            )
+        if features.get("critical_edges"):
+            for edge in features["critical_edges"][:2]:
+                feature_lines.append(
+                    f"  - Critical edge at Qc={edge.get('Qc', 0):.4f} Å⁻¹"
+                )
+    features_str = "\n".join(feature_lines) if feature_lines else "  (no features)"
+
+    # Serialize current model (strip fitted params for cleaner prompt)
+    model_for_prompt = {k: v for k, v in current_model.items()
+                        if k not in ("fitted_parameters", "fitted_uncertainties")}
+    current_model_json = json.dumps(model_for_prompt, indent=2)
+
+    data_file = current_model.get("data_file", "")
+
+    # Format user feedback
+    feedback_section = ""
+    if user_feedback:
+        feedback_section = (
+            "\n## User Feedback (from the scientist running this analysis)\n"
+            f"{user_feedback}\n\n"
+            "IMPORTANT: The user's feedback above is authoritative. Follow it "
+            "even if it conflicts with any of the numbered rules above. The "
+            "user is the domain expert and their instructions override all "
+            "default constraints.\n"
+        )
+
+    return (
+        MODEL_REFINEMENT_JSON_PROMPT.format(
+            sample_description=sample_description or "(not provided)",
+            current_model_json=current_model_json,
+            chi_squared=fit_result.get("chi_squared", float("inf")),
+            method=fit_result.get("method", "unknown"),
+            converged="Yes" if fit_result.get("converged", False) else "No",
+            parameters=params_str,
+            issues=issues_str,
+            suggestions=suggestions_str,
+            features=features_str,
+            data_file=data_file,
+            user_constraints=user_constraints,
+            residual_analysis=_format_residual_analysis(
+                fit_result.get("residual_analysis")
+            ),
+        )
+        + feedback_section
+    )

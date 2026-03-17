@@ -42,6 +42,15 @@ class AmbientInfo(TypedDict):
     sld: float
 
 
+class IntensityInfo(TypedDict, total=False):
+    """Probe intensity normalization settings."""
+
+    value: float  # Starting intensity (default 1.0)
+    min: float  # Lower bound (default 0.7)
+    max: float  # Upper bound (default 1.1)
+    fixed: bool  # If True, intensity is not a fit parameter
+
+
 class ParsedSample(TypedDict):
     """Structured sample information parsed from user description."""
 
@@ -51,6 +60,35 @@ class ParsedSample(TypedDict):
     constraints: List[str]
     hypothesis: Optional[str]
     back_reflection: bool  # True if neutrons come from substrate side
+
+
+class ModelDefinition(TypedDict, total=False):
+    """
+    Canonical JSON representation of a refl1d layer model.
+
+    Extends ParsedSample with fields needed to build a FitProblem:
+    data file path, intensity settings, and (after fitting) best-fit
+    parameter values and uncertainties.
+
+    The workflow stores this instead of a Python script string.
+    Experiment/FitProblem objects are built on-the-fly from this dict
+    by :func:`aure.nodes.model_builder.build_problem`.
+    """
+
+    # ---- Structure (same fields as ParsedSample) ----
+    substrate: SubstrateInfo
+    layers: List[LayerInfo]
+    ambient: AmbientInfo
+    constraints: List[str]
+    back_reflection: bool
+
+    # ---- Fitting context ----
+    data_file: str  # Absolute path to reflectivity data
+    intensity: IntensityInfo
+
+    # ---- Post-fit snapshots (populated after fitting) ----
+    fitted_parameters: dict  # {param_name: value}
+    fitted_uncertainties: dict  # {param_name: uncertainty}
 
 
 class ExtractedFeatures(TypedDict):
@@ -150,14 +188,14 @@ class ReflectivityState(TypedDict):
     extracted_features: Optional[ExtractedFeatures]
 
     # ========== Model State ==========
-    current_model: Optional[str]  # refl1d Python script
+    current_model: Optional[dict]  # ModelDefinition JSON (or legacy script str)
     model_history: Annotated[List[dict], operator.add]  # Accumulates models
 
     # ========== Fit Results ==========
     fit_results: Annotated[List[FitResult], operator.add]  # Accumulates fits
     current_chi2: Optional[float]
     best_chi2: Optional[float]
-    best_model: Optional[str]  # Model script that produced the best χ²
+    best_model: Optional[dict]  # ModelDefinition that produced the best χ²
 
     # ========== Conversation ==========
     messages: Annotated[List[Message], operator.add]

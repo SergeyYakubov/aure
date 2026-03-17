@@ -179,7 +179,13 @@ class CheckpointManager:
 
         # Save model if present
         if state.get("current_model"):
-            self._save_model(state["current_model"], node_name, iteration)
+            self._save_model(
+                state["current_model"], node_name, iteration,
+                checkpoint_number=self._checkpoint_counter,
+            )
+
+        # Write companion markdown log with readable messages
+        self._save_checkpoint_log(checkpoint_path, state, node_name, iteration)
 
         logger.info(f"[CHECKPOINT] Saved: {filename}")
         return str(checkpoint_path)
@@ -220,12 +226,12 @@ class CheckpointManager:
     def _save_final_model(self, state: Dict[str, Any]):
         """Write ``models/model_final.py`` with fitted parameter values.
 
-        Takes the best model script, substitutes the best-fit values into the
-        material / layer definitions, and replaces ``.range()`` calls with
-        comments showing the original range.
+        For JSON ``ModelDefinition`` dicts, uses ``export_model_script``.
+        For legacy script strings, patches values via regex and strips
+        ``.range()`` calls.
         """
-        model_script = state.get("best_model") or state.get("current_model")
-        if not model_script:
+        model = state.get("best_model") or state.get("current_model")
+        if not model:
             return
 
         fit_results = state.get("fit_results", [])
@@ -253,8 +259,28 @@ class CheckpointManager:
         if not params:
             return
 
-        script = self._patch_model_parameters(model_script, params)
-        script = self._strip_range_calls(script)
+        out_path = self.models_dir / "model_final.py"
+
+        if isinstance(model, dict):
+            # New JSON path
+            from aure.nodes.model_builder import export_model_script
+
+            script = export_model_script(
+                model,
+                fitted_params=params,
+                uncertainties=uncertainties,
+                include_ranges=False,
+            )
+            # Also save the JSON definition with fitted values applied
+            json_path = self.models_dir / "model_final.json"
+            final_def = dict(model)
+            final_def["fitted_parameters"] = params
+            final_def["fitted_uncertainties"] = uncertainties
+            self._save_json(json_path, final_def)
+        else:
+            # Legacy script path
+            script = self._patch_model_parameters(str(model), params)
+            script = self._strip_range_calls(script)
 
         # Prepend a header with fit metadata
         header_lines = [
@@ -275,7 +301,6 @@ class CheckpointManager:
 
         script = "\n".join(header_lines) + "\n" + script
 
-        out_path = self.models_dir / "model_final.py"
         out_path.write_text(script)
         logger.info(f"[CHECKPOINT] Saved final model: {out_path}")
 
@@ -401,17 +426,81 @@ class CheckpointManager:
             flags=re.MULTILINE,
         )
 
-    def _save_model(self, model_script: str, node_name: str, iteration: int):
-        """Save model script to models directory."""
-        if node_name == "modeling" and iteration == 0:
-            filename = "model_initial.py"
-        elif node_name == "refinement":
-            filename = f"model_refined_iter{iteration}.py"
-        else:
-            filename = f"model_{node_name}_iter{iteration}.py"
+    def _save_model(
+        self,
+        model: object,
+        node_name: str,
+        iteration: int,
+        checkpoint_number: int | None = None,
+    ):
+        """Save model to models directory.
 
-        model_path = self.models_dir / filename
-        model_path.write_text(model_script)
+        For new JSON ``ModelDefinition`` dicts, saves both a ``.json`` and a
+        ``.py`` (via ``export_model_script``).  For legacy script strings,
+        saves only the ``.py`` file.
+
+        File names mirror the checkpoint numbering so that checkpoint
+        ``003_modeling.json`` produces ``003_model_modeling.json``.
+        """
+        prefix = f"{checkpoint_number:03d}_" if checkpoint_number else ""
+
+        if node_name == "modeling" and iteration == 0:
+            base = f"{prefix}model_initial"
+        elif node_name == "refinement":
+            base = f"{prefix}model_refinement_iter{iteration}"
+        elif iteration > 0:
+            base = f"{prefix}model_{node_name}_iter{iteration}"
+        else:
+            base = f"{prefix}model_{node_name}"
+
+        if isinstance(model, dict):
+            # JSON path — save definition as JSON
+            json_path = self.models_dir / f"{base}.json"
+            self._save_json(json_path, model)
+            # Also export a readable .py for inspection
+            try:
+                from aure.nodes.model_builder import export_model_script
+
+                script = export_model_script(model)
+                py_path = self.models_dir / f"{base}.py"
+                py_path.write_text(script)
+            except Exception as exc:
+                logger.debug("Could not export model script for %s: %s", base, exc)
+        else:
+            # Legacy script string
+            model_path = self.models_dir / f"{base}.py"
+            model_path.write_text(str(model))
+
+    def _save_checkpoint_log(
+        self, checkpoint_path: Path, state: Dict[str, Any],
+        node_name: str, iteration: int,
+    ):
+        """Write a companion ``.md`` file with human-readable messages.
+
+        The file lives next to the checkpoint JSON and shares its name,
+        e.g. ``003_modeling.md``.
+        """
+        messages = state.get("messages") or []
+        if not messages:
+            return
+
+        md_path = checkpoint_path.with_suffix(".md")
+        lines = [
+            f"# Checkpoint: {node_name} (iteration {iteration})",
+            f"_Saved at {datetime.now().isoformat()}_",
+            "",
+        ]
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = "\n".join(content)
+            lines.append(f"## [{role}]")
+            lines.append("")
+            lines.append(content)
+            lines.append("")
+
+        md_path.write_text("\n".join(lines), encoding="utf-8")
 
     def _update_run_info(self, checkpoint_file: str, node_name: str, iteration: int):
         """Update run_info.json with new checkpoint."""
@@ -471,9 +560,17 @@ class CheckpointManager:
         return result
 
     def _save_json(self, path: Path, data: Dict):
-        """Save data as JSON with pretty formatting."""
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2, default=str)
+        """Save data as JSON with pretty formatting.
+
+        Uses ``ensure_ascii=False`` so that Unicode characters (Å, χ², etc.)
+        are written directly rather than as ``\\uXXXX`` escapes.
+
+        Message ``content`` strings are split into arrays of lines so that
+        multi-line messages are easy to read in the raw JSON.
+        """
+        serializable = _format_messages_for_json(data)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, indent=2, default=str, ensure_ascii=False)
 
     @classmethod
     def load_checkpoint(cls, checkpoint_path: str) -> Dict[str, Any]:
@@ -490,10 +587,12 @@ class CheckpointManager:
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             checkpoint_data = json.load(f)
 
-        # State is already JSON-compatible from loading
+        # Rejoin message content that was split into line arrays for readability
+        _rejoin_message_content(checkpoint_data)
+
         logger.info(f"[CHECKPOINT] Loaded: {checkpoint_path}")
         return checkpoint_data
 
@@ -596,3 +695,47 @@ def get_node_after(node_name: str) -> Optional[str]:
     except ValueError:
         pass
     return None
+
+
+# ======================================================================
+# JSON formatting helpers
+# ======================================================================
+
+
+def _format_messages_for_json(data: object) -> object:
+    """Split message ``content`` strings into arrays of lines.
+
+    Walks the data tree looking for message dicts (containing ``role``
+    and ``content`` keys).  When ``content`` is a multi-line string it
+    is replaced with a list of lines so the JSON file is human-readable.
+
+    Returns a *new* object — the original is not mutated.
+    """
+    if isinstance(data, dict):
+        out: dict = {}
+        for k, v in data.items():
+            out[k] = _format_messages_for_json(v)
+        # Detect a message dict and split its content
+        if "role" in out and "content" in out and isinstance(out["content"], str):
+            if "\n" in out["content"]:
+                out["content"] = out["content"].split("\n")
+        return out
+    if isinstance(data, list):
+        return [_format_messages_for_json(item) for item in data]
+    return data
+
+
+def _rejoin_message_content(data: object) -> None:
+    """Rejoin message ``content`` arrays back into strings (in-place).
+
+    Reverses the transformation done by :func:`_format_messages_for_json`
+    so that loaded checkpoint state has regular string content.
+    """
+    if isinstance(data, dict):
+        if "role" in data and "content" in data and isinstance(data["content"], list):
+            data["content"] = "\n".join(data["content"])
+        for v in data.values():
+            _rejoin_message_content(v)
+    elif isinstance(data, list):
+        for item in data:
+            _rejoin_message_content(item)

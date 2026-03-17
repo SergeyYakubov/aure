@@ -117,6 +117,72 @@ def _apply_overrides_to_model_script(
     return script
 
 
+def _apply_overrides_to_model_definition(
+    definition: dict,
+    parameter_overrides: dict,
+    bounds_overrides: dict,
+) -> dict:
+    """Apply user parameter/bounds overrides to a JSON ModelDefinition.
+
+    Returns a new dict with updated starting values and bounds.  Parameter
+    names follow the refl1d convention: ``"<material> <attribute>"``.
+    """
+    import copy
+
+    defn = copy.deepcopy(definition)
+
+    # Build a lookup: (material, attr) → value
+    p_lookup: dict[tuple, float] = {}
+    for name, val in parameter_overrides.items():
+        parts = name.rsplit(" ", 1)
+        if len(parts) == 2:
+            try:
+                p_lookup[(parts[0], parts[1])] = float(val)
+            except (ValueError, TypeError):
+                pass
+
+    b_lookup: dict[tuple, list] = {}
+    for name, pair in bounds_overrides.items():
+        if not isinstance(pair, list) or len(pair) != 2:
+            continue
+        parts = name.rsplit(" ", 1)
+        if len(parts) == 2:
+            try:
+                b_lookup[(parts[0], parts[1])] = [float(pair[0]), float(pair[1])]
+            except (ValueError, TypeError):
+                pass
+
+    # Apply to layers
+    attr_map = {
+        "rho": "sld",
+        "thickness": "thickness",
+        "interface": "roughness",
+    }
+    bound_suffixes = {"sld": ("sld_min", "sld_max"), "thickness": ("thickness_min", "thickness_max"), "roughness": ("roughness_min", "roughness_max")}
+
+    for layer in defn.get("layers", []):
+        mat_name = layer.get("name", "")
+        for refl1d_attr, json_key in attr_map.items():
+            key = (mat_name, refl1d_attr)
+            if key in p_lookup:
+                layer[json_key] = p_lookup[key]
+            b_key = key
+            if b_key in b_lookup and json_key in bound_suffixes:
+                lo_k, hi_k = bound_suffixes[json_key]
+                layer[lo_k] = b_lookup[b_key][0]
+                layer[hi_k] = b_lookup[b_key][1]
+
+    # Apply to substrate
+    sub = defn.get("substrate", {})
+    sub_name = sub.get("name", "")
+    if (sub_name, "interface") in p_lookup:
+        sub["roughness"] = p_lookup[(sub_name, "interface")]
+    if (sub_name, "interface") in b_lookup:
+        sub["roughness_max"] = b_lookup[(sub_name, "interface")][1]
+
+    return defn
+
+
 # ------------------------------------------------------------------
 # Page routes
 # ------------------------------------------------------------------
@@ -250,10 +316,81 @@ def api_simulate():
         except (ValueError, TypeError, IndexError):
             bounds = None
 
-    result = rd.simulate(parameters, bounds=bounds)
+    iteration = body.get("iteration")
+    if iteration is not None:
+        try:
+            iteration = int(iteration)
+        except (ValueError, TypeError):
+            iteration = None
+
+    result = rd.simulate(parameters, bounds=bounds, iteration=iteration)
     if "error" in result:
         return jsonify(result), 500
     return jsonify(result)
+
+
+@bp.route("/api/export-script")
+def api_export_script():
+    """Export the model as a standalone refl1d Python script.
+
+    Query parameters:
+        iteration (int, optional) — fit iteration to use for parameter values.
+            Defaults to the best-chi² iteration.
+        include_ranges (bool, optional) — include ``.range()`` calls.
+            Defaults to ``false``.
+
+    Returns ``{"script": "<python source code>"}`` or an error.
+    """
+    rd = _run_data()
+    if not rd:
+        return jsonify({"error": "No analysis output found"}), 404
+
+    state = rd.get_final_state()
+    model = state.get("best_model") or state.get("current_model")
+    if not model:
+        return jsonify({"error": "No model available"}), 404
+
+    if not isinstance(model, dict):
+        # Legacy: try to read model_final.py from disk
+        final_py = rd.output_dir / "models" / "model_final.py"
+        if final_py.exists():
+            return jsonify({"script": final_py.read_text()})
+        return jsonify({"error": "Legacy model — no JSON definition available"}), 404
+
+    from aure.nodes.model_builder import export_model_script
+
+    iteration = request.args.get("iteration", default=None, type=int)
+    include_ranges = request.args.get("include_ranges", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+    fit_results = state.get("fit_results", [])
+    fitted_params: dict | None = None
+    uncertainties: dict | None = None
+
+    if fit_results:
+        if iteration is not None:
+            selected = next(
+                (fr for fr in fit_results if fr.get("iteration") == iteration),
+                None,
+            )
+        else:
+            selected = min(
+                fit_results, key=lambda f: f.get("chi_squared", float("inf"))
+            )
+        if selected:
+            fitted_params = selected.get("parameters")
+            uncertainties = selected.get("uncertainties")
+
+    script = export_model_script(
+        model,
+        fitted_params=fitted_params,
+        uncertainties=uncertainties,
+        include_ranges=include_ranges,
+    )
+    return jsonify({"script": script})
 
 
 @bp.route("/api/llm-status")
@@ -650,16 +787,19 @@ def api_restart_analysis():
     insight = (body.get("insight") or "").strip()
     restart_from = (body.get("restart_from") or "modeling").strip()
     dream_steps = body.get("dream_steps")  # int or None
-    checkpoint_iteration = body.get("checkpoint_iteration")  # int or None
+    checkpoint_step = body.get("checkpoint_step")  # int or None (1-based step)
+    checkpoint_iteration = body.get("checkpoint_iteration")  # int or None (legacy)
     parameter_overrides = body.get("parameter_overrides")  # {name: value} or None
     bounds_overrides = body.get("bounds_overrides")  # {name: [lo, hi]} or None
 
-    if not insight:
-        return jsonify({"errors": ["insight is required"]}), 400
-    if restart_from not in ("modeling", "analysis"):
+    if restart_from not in ("modeling", "analysis", "fitting"):
         return jsonify(
-            {"errors": ["restart_from must be 'modeling' or 'analysis'"]}
+            {"errors": ["restart_from must be 'modeling', 'analysis', or 'fitting'"]}
         ), 400
+    if not insight and restart_from != "fitting":
+        return jsonify({"errors": ["insight is required"]}), 400
+    if restart_from == "fitting" and not insight:
+        insight = "Refit with user-adjusted parameters"
 
     # ---- Load the completed state from disk -----------------------
     output_dir = current_app.config.get("OUTPUT_DIR")
@@ -674,13 +814,48 @@ def api_restart_analysis():
     if not final_state:
         return jsonify({"error": "Could not load final state from previous run"}), 404
 
+    # ---- Read max iteration from all existing checkpoints ---------
+    import json as _json
+
+    run_info_path = Path(output_dir) / "run_info.json"
+    max_iteration = final_state.get("iteration", 0)
+    if run_info_path.exists():
+        try:
+            run_info_data = _json.loads(run_info_path.read_text())
+            for cp_entry in run_info_data.get("checkpoints", []):
+                cp_iter = cp_entry.get("iteration", 0)
+                if cp_iter > max_iteration:
+                    max_iteration = cp_iter
+        except Exception:
+            pass
+
     # ---- Optionally load from a specific checkpoint ---------------
-    if checkpoint_iteration is not None:
+    if checkpoint_step is not None:
+        # Load by step number (1-based index into run_info checkpoints)
+        cp_dir = Path(output_dir) / "checkpoints"
+        cp_state = None
+        if run_info_path.exists() and cp_dir.exists():
+            try:
+                ri = _json.loads(run_info_path.read_text())
+                cp_list = ri.get("checkpoints", [])
+                step_idx = int(checkpoint_step) - 1
+                if 0 <= step_idx < len(cp_list):
+                    cp_file = cp_dir / cp_list[step_idx]["file"]
+                    if cp_file.exists():
+                        cp_data = _json.loads(cp_file.read_text())
+                        cp_state = cp_data.get("state", cp_data)
+            except Exception:
+                pass
+        if cp_state:
+            final_state = cp_state
+        else:
+            return jsonify(
+                {"error": f"Checkpoint step {checkpoint_step} not found"}
+            ), 404
+    elif checkpoint_iteration is not None:
+        # Legacy: load by iteration number (finds the last match)
         cp_dir = Path(output_dir) / "checkpoints"
         if cp_dir.exists():
-            # Find checkpoint file matching the requested iteration
-            import json as _json
-
             cp_state = None
             for cp_file in sorted(cp_dir.glob("*.json")):
                 try:
@@ -688,7 +863,6 @@ def api_restart_analysis():
                     cp_st = cp_data.get("state", cp_data)
                     if cp_st.get("iteration") == int(checkpoint_iteration):
                         cp_state = cp_st
-                        break
                 except Exception:
                     continue
             if cp_state:
@@ -699,6 +873,9 @@ def api_restart_analysis():
                         "error": f"Checkpoint for iteration {checkpoint_iteration} not found"
                     }
                 ), 404
+
+    # Override iteration to continue from max seen across all checkpoints
+    final_state["iteration"] = max_iteration
 
     interactive = bool(body.get("interactive", False))
 
@@ -748,33 +925,38 @@ def api_restart_analysis():
                         pass
             latest["bounds"] = bounds
 
-    # Update current_model script with overrides
-    if (parameter_overrides or bounds_overrides) and restarted_state.get(
-        "current_model"
-    ):
-        restarted_state["current_model"] = _apply_overrides_to_model_script(
-            restarted_state["current_model"],
-            parameter_overrides or {},
-            bounds_overrides or {},
-        )
+    # Update current_model with overrides
+    current_model = restarted_state.get("current_model")
+    if (parameter_overrides or bounds_overrides) and current_model:
+        if isinstance(current_model, dict):
+            # JSON ModelDefinition — apply overrides directly to the dict
+            restarted_state["current_model"] = _apply_overrides_to_model_definition(
+                current_model,
+                parameter_overrides or {},
+                bounds_overrides or {},
+            )
+        else:
+            restarted_state["current_model"] = _apply_overrides_to_model_script(
+                current_model,
+                parameter_overrides or {},
+                bounds_overrides or {},
+            )
 
     # ---- Update run_info.json with restart metadata ---------------
-    import json
     from datetime import datetime
 
-    run_info_path = Path(output_dir) / "run_info.json"
     if run_info_path.exists():
-        run_info = json.loads(run_info_path.read_text())
+        run_info = _json.loads(run_info_path.read_text())
         restarts = run_info.setdefault("restarts", [])
         restarts.append(
             {
                 "restarted_at": datetime.now().isoformat(),
                 "restart_from": restart_from,
                 "insight": insight,
-                "iteration_at_restart": final_state.get("iteration", 0),
+                "iteration_at_restart": max_iteration,
             }
         )
-        run_info_path.write_text(json.dumps(run_info, indent=2, default=str))
+        run_info_path.write_text(_json.dumps(run_info, indent=2, default=str))
 
     # ---- Reset run state and launch background thread -------------
     with lock:

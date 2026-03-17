@@ -24,6 +24,7 @@ from ..database import get_sld
 from ..llm import llm_available, get_llm
 from ..config import format_user_constraints
 from .prompts import format_model_refinement_prompt
+from .model_builder import definition_from_parsed_sample, export_model_script
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +57,9 @@ def _refine_model(state: ReflectivityState) -> Dict[str, Any]:
     """
     Refine an existing model using LLM based on evaluation feedback.
 
-    The LLM receives the current model script, fit parameters, issues,
-    and suggestions, and generates a complete improved model script.
+    The LLM receives the current ModelDefinition JSON, fit parameters,
+    issues, and suggestions, and returns an improved ModelDefinition JSON.
+    Falls back to the legacy script-based prompt if the model is a string.
     """
     updates = {
         "current_node": "modeling",
@@ -73,7 +75,7 @@ def _refine_model(state: ReflectivityState) -> Dict[str, Any]:
 
     fit_results = state.get("fit_results", [])
     latest_fit = fit_results[-1]
-    current_model = state.get("current_model", "")
+    current_model = state.get("current_model", {})
 
     issues = latest_fit.get("issues", [])
     suggestions = latest_fit.get("suggestions", [])
@@ -86,11 +88,26 @@ def _refine_model(state: ReflectivityState) -> Dict[str, Any]:
         )
         return updates
 
+    # Legacy path: if current_model is a script string, use old prompt
+    if isinstance(current_model, str):
+        return _refine_model_legacy(state)
+
     try:
+        from .prompts import format_model_refinement_prompt_json
+        import json as _json
+        import copy
+
         user_constraints = format_user_constraints(state.get("user_config"))
         user_feedback = state.get("pending_user_feedback")
-        prompt = format_model_refinement_prompt(
-            current_model=current_model,
+
+        # Update the definition with latest fitted values before sending to LLM
+        model_for_llm = copy.deepcopy(current_model)
+        fitted = latest_fit.get("parameters", {})
+        if fitted:
+            _apply_fitted_values_to_definition(model_for_llm, fitted)
+
+        prompt = format_model_refinement_prompt_json(
+            current_model=model_for_llm,
             sample_description=state.get("sample_description", ""),
             fit_result=latest_fit,
             features=state.get("extracted_features") or {},
@@ -103,19 +120,130 @@ def _refine_model(state: ReflectivityState) -> Dict[str, Any]:
 
         llm = get_llm(temperature=0)
         response = llm.invoke([HumanMessage(content=prompt)])
+        raw = response.content.strip()
+
+        # Strip markdown fences if present
+        raw = _strip_code_fences(raw)
+
+        # Parse JSON response
+        new_model = _parse_model_json(raw)
+
+        if new_model is None:
+            logger.warning(
+                "[MODELING] LLM returned invalid JSON, falling back to widened bounds"
+            )
+            new_model = _widen_all_bounds_json(current_model)
+            updates["llm_calls"].append(
+                LLMCallRecord(
+                    node="modeling",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    success=True,
+                    used_fallback=True,
+                    fallback_reason="LLM output failed JSON validation; fell back to widened bounds",
+                    error=None,
+                )
+            )
+        else:
+            # Ensure immutable fields are preserved
+            new_model["data_file"] = current_model.get("data_file", "")
+            new_model["back_reflection"] = current_model.get("back_reflection", False)
+            updates["llm_calls"].append(
+                LLMCallRecord(
+                    node="modeling",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    success=True,
+                    used_fallback=False,
+                    fallback_reason=None,
+                    error=None,
+                )
+            )
+
+        updates["current_model"] = new_model
+        updates["model_history"] = [
+            {
+                "iteration": iteration,
+                "description": f"Refined model (iteration {iteration})",
+                "refinement_issues": issues,
+                "refinement_suggestions": suggestions,
+                "definition": new_model,
+            }
+        ]
+
+        # Format explanation message
+        changes = _summarize_definition_changes(current_model, new_model)
+        updates["messages"] = [
+            Message(
+                role="assistant",
+                content=_format_refinement_explanation(changes, issues, suggestions),
+                timestamp=None,
+            )
+        ]
+
+    except Exception as e:
+        error_msg = str(e).lower()
+        if (
+            "quota" in error_msg
+            or "rate" in error_msg
+            or "limit" in error_msg
+            or "429" in str(e)
+        ):
+            updates["error"] = (
+                "LLM quota/rate limit exceeded. Please wait or switch provider."
+            )
+        else:
+            updates["error"] = f"Model refinement failed: {str(e)[:200]}"
+        logger.error(f"[MODELING] LLM refinement error: {e}")
+        updates["llm_calls"].append(
+            LLMCallRecord(
+                node="modeling",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                success=False,
+                used_fallback=False,
+                fallback_reason=None,
+                error=str(e)[:200],
+            )
+        )
+
+    return updates
+
+
+def _refine_model_legacy(state: ReflectivityState) -> Dict[str, Any]:
+    """Legacy refinement path for script-string models."""
+    updates = {
+        "current_node": "modeling",
+        "messages": [],
+        "model_history": [],
+        "llm_calls": [],
+    }
+
+    iteration = state.get("iteration", 0)
+    fit_results = state.get("fit_results", [])
+    latest_fit = fit_results[-1]
+    current_model = state.get("current_model", "")
+    issues = latest_fit.get("issues", [])
+    suggestions = latest_fit.get("suggestions", [])
+
+    try:
+        user_constraints = format_user_constraints(state.get("user_config"))
+        user_feedback = state.get("pending_user_feedback")
+        prompt = format_model_refinement_prompt(
+            current_model=current_model,
+            sample_description=state.get("sample_description", ""),
+            fit_result=latest_fit,
+            features=state.get("extracted_features") or {},
+            user_constraints=user_constraints,
+            user_feedback=user_feedback,
+        )
+        if user_feedback:
+            updates["pending_user_feedback"] = None
+
+        llm = get_llm(temperature=0)
+        response = llm.invoke([HumanMessage(content=prompt)])
         new_model = response.content.strip()
-
-        # Strip markdown code fences if present
         new_model = _strip_code_fences(new_model)
-
-        # Fix common LLM mistake: var.material.rho → sample[i].material.rho
         new_model = _fix_sld_attr_access(new_model)
 
-        # Validate the generated script has required components
         if not _validate_model_script(new_model):
-            logger.warning(
-                "[MODELING] LLM-generated script missing required components, keeping current model with widened bounds"
-            )
             new_model = _widen_all_bounds(current_model)
             updates["llm_calls"].append(
                 LLMCallRecord(
@@ -150,7 +278,6 @@ def _refine_model(state: ReflectivityState) -> Dict[str, Any]:
             }
         ]
 
-        # Format explanation message
         changes = _summarize_model_changes(current_model, new_model)
         updates["messages"] = [
             Message(
@@ -207,11 +334,9 @@ def _build_initial_model(state: ReflectivityState) -> Dict[str, Any]:
     ambient = _get_ambient(parsed)
     layers = _build_layers(parsed, features)
 
-    # ========== Generate refl1d Script ==========
-    # Check for back reflection geometry
+    # ========== Build ModelDefinition ==========
     back_reflection = parsed.get("back_reflection", False)
 
-    # Get intensity normalization settings (default: vary 0.7–1.1)
     intensity_settings = parsed.get("intensity", {})
     intensity = {
         "value": intensity_settings.get("value", 1.0),
@@ -221,21 +346,24 @@ def _build_initial_model(state: ReflectivityState) -> Dict[str, Any]:
     }
 
     try:
-        model_script = build_refl1d_script(
-            layers=layers,
-            substrate=substrate,
-            ambient=ambient,
-            data_file=state["data_file"],
-            back_reflection=back_reflection,
-            intensity=intensity,
-        )
-        updates["current_model"] = model_script
+        import os
+
+        model_def = {
+            "substrate": substrate,
+            "layers": layers,
+            "ambient": ambient,
+            "constraints": parsed.get("constraints", []),
+            "back_reflection": back_reflection,
+            "data_file": os.path.abspath(state["data_file"]),
+            "intensity": intensity,
+        }
+        updates["current_model"] = model_def
         updates["model_history"] = [
             {
                 "iteration": state.get("iteration", 0),
                 "n_layers": len(layers),
                 "description": f"{len(layers)}-layer model",
-                "script": model_script,
+                "definition": model_def,
             }
         ]
 
@@ -762,3 +890,137 @@ def _format_refinement_explanation(
     lines.append("*Re-running fit with refined model...*")
 
     return "\n".join(lines)
+
+
+# ============================================================================
+# JSON model refinement helpers
+# ============================================================================
+
+
+def _parse_model_json(raw: str) -> dict | None:
+    """Parse LLM output as a ModelDefinition JSON.
+
+    Returns the parsed dict or *None* if parsing / validation fails.
+    """
+    import json as _json
+    import regex
+
+    def _fix_json(t: str) -> str:
+        """Remove trailing commas and single-line comments."""
+        import re as _re
+        t = _re.sub(r"//[^\n]*", "", t)
+        t = _re.sub(r",\s*([}\]])", r"\1", t)
+        return t
+
+    # Try direct parse first
+    try:
+        obj = _json.loads(_fix_json(raw))
+        if _validate_model_json(obj):
+            return obj
+    except _json.JSONDecodeError:
+        pass
+
+    # Try extracting JSON from surrounding text
+    m = regex.search(r"\{[\s\S]*\}", raw)
+    if m:
+        try:
+            obj = _json.loads(_fix_json(m.group(0)))
+            if _validate_model_json(obj):
+                return obj
+        except _json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def _validate_model_json(obj: dict) -> bool:
+    """Check that a parsed dict has minimum required ModelDefinition fields."""
+    if not isinstance(obj, dict):
+        return False
+    required = {"substrate", "layers", "ambient"}
+    if not required.issubset(obj.keys()):
+        return False
+    if not isinstance(obj["layers"], list):
+        return False
+    if not isinstance(obj["substrate"], dict) or "sld" not in obj["substrate"]:
+        return False
+    if not isinstance(obj["ambient"], dict) or "sld" not in obj["ambient"]:
+        return False
+    return True
+
+
+def _widen_all_bounds_json(model: dict) -> dict:
+    """Fallback: widen all layer bounds by 50% in a ModelDefinition."""
+    import copy
+
+    widened = copy.deepcopy(model)
+    for layer in widened.get("layers", []):
+        for key_pair in [
+            ("sld_min", "sld_max", "sld"),
+            ("thickness_min", "thickness_max", "thickness"),
+        ]:
+            lo_key, hi_key, val_key = key_pair
+            lo = layer.get(lo_key)
+            hi = layer.get(hi_key)
+            if lo is not None and hi is not None:
+                spread = hi - lo
+                layer[lo_key] = lo - spread * 0.25
+                layer[hi_key] = hi + spread * 0.25
+        # Widen roughness_max
+        r_max = layer.get("roughness_max")
+        if r_max is not None:
+            layer["roughness_max"] = r_max * 1.5
+    return widened
+
+
+def _apply_fitted_values_to_definition(model: dict, fitted: dict) -> None:
+    """Update a ModelDefinition in-place with fitted parameter values."""
+    for layer in model.get("layers", []):
+        name = layer["name"]
+        if f"{name} thickness" in fitted:
+            layer["thickness"] = fitted[f"{name} thickness"]
+        if f"{name} rho" in fitted:
+            layer["sld"] = fitted[f"{name} rho"]
+        if f"{name} interface" in fitted:
+            layer["roughness"] = fitted[f"{name} interface"]
+
+
+def _summarize_definition_changes(
+    old_model: dict, new_model: dict
+) -> list[str]:
+    """Summarize differences between two ModelDefinition dicts."""
+    changes = []
+
+    old_layers = old_model.get("layers", [])
+    new_layers = new_model.get("layers", [])
+
+    if len(new_layers) != len(old_layers):
+        changes.append(f"Layer count changed: {len(old_layers)} → {len(new_layers)}")
+
+    old_names = {l["name"] for l in old_layers}
+    new_names = {l["name"] for l in new_layers}
+    added = new_names - old_names
+    removed = old_names - new_names
+    if added:
+        changes.append(f"Added materials: {', '.join(added)}")
+    if removed:
+        changes.append(f"Removed materials: {', '.join(removed)}")
+
+    # Check for significant bound changes
+    for nl in new_layers:
+        for ol in old_layers:
+            if nl["name"] == ol["name"]:
+                for attr in ("sld_min", "sld_max", "thickness_min", "thickness_max"):
+                    ov = ol.get(attr)
+                    nv = nl.get(attr)
+                    if ov is not None and nv is not None and abs(nv - ov) > 0.1:
+                        changes.append(
+                            f"{nl['name']} {attr}: {ov:.1f} → {nv:.1f}"
+                        )
+                        break  # One note per layer is enough
+                break
+
+    if not changes:
+        changes.append("Parameter values and bounds adjusted")
+
+    return changes

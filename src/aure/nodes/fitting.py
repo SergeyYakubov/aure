@@ -1,8 +1,8 @@
 """
 FITTING node: Run refl1d optimization.
 
-This node executes the generated refl1d model script to fit the data.
-Supports multiple fitting methods:
+This node builds a FitProblem from the ModelDefinition JSON and fits
+the data using bumps.  Supports multiple fitting methods:
 - 'lm': Levenberg-Marquardt (fast, local optimizer)
 - 'de': Differential Evolution (global optimizer)
 - 'dream': MCMC for uncertainty quantification
@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from ..state import ReflectivityState, FitResult, Message
+from .model_builder import build_problem, is_legacy_script
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +38,8 @@ def fitting_node(state: ReflectivityState) -> Dict[str, Any]:
         "fit_results": [],
     }
 
-    model_script = state.get("current_model")
-    if not model_script:
+    model = state.get("current_model")
+    if not model:
         updates["error"] = "No model to fit"
         return updates
 
@@ -63,14 +64,26 @@ def fitting_node(state: ReflectivityState) -> Dict[str, Any]:
     # ========== Run Fit ==========
     try:
         logger.info(f"[FITTING] Running {method.upper()} optimization...")
-        result = run_refl1d_fit(
-            model_script=model_script,
-            method=method,
-            iteration=iteration,
-            steps=steps,
-            burn=burn,
-            export_dir=export_dir,
-        )
+
+        if is_legacy_script(model):
+            # Backward compatibility: exec-based path for old script models
+            result = _run_refl1d_fit_legacy(
+                model_script=model,
+                method=method,
+                iteration=iteration,
+                steps=steps,
+                burn=burn,
+                export_dir=export_dir,
+            )
+        else:
+            result = run_refl1d_fit(
+                model_definition=model,
+                method=method,
+                iteration=iteration,
+                steps=steps,
+                burn=burn,
+                export_dir=export_dir,
+            )
 
         updates["fit_results"] = [result]
         updates["current_chi2"] = result["chi_squared"]
@@ -80,7 +93,7 @@ def fitting_node(state: ReflectivityState) -> Dict[str, Any]:
         best = state.get("best_chi2")
         if best is None or result["chi_squared"] < best:
             updates["best_chi2"] = result["chi_squared"]
-            updates["best_model"] = model_script
+            updates["best_model"] = model
             logger.info(f"[FITTING] New best χ² = {result['chi_squared']:.3f}")
 
         # Format message
@@ -102,7 +115,7 @@ def fitting_node(state: ReflectivityState) -> Dict[str, Any]:
 
 
 def run_refl1d_fit(
-    model_script: str,
+    model_definition: dict,
     method: str = "lm",
     iteration: int = 0,
     steps: int = 1000,
@@ -110,10 +123,10 @@ def run_refl1d_fit(
     export_dir: Optional[str] = None,
 ) -> FitResult:
     """
-    Execute refl1d fit using bumps.fit directly.
+    Execute refl1d fit by building a FitProblem from a ModelDefinition.
 
     Args:
-        model_script: Python script defining the model
+        model_definition: ModelDefinition dict describing the model
         method: Fitting method ('lm', 'de', 'dream')
         iteration: Current iteration number
         steps: Number of steps for MCMC methods
@@ -125,53 +138,52 @@ def run_refl1d_fit(
     """
     from bumps.fitters import fit as bumps_fit
 
-    # Create temporary directory for model execution
+    problem = build_problem(model_definition)
+
+    # Configure fit options based on method
+    fit_options = _build_fit_options(method, steps, burn, export_dir)
+
+    # Run the fit
+    logger.info(f"[FITTING] Running {method.upper()} with bumps.fit...")
+    result = bumps_fit(problem, **fit_options)
+
+    # Extract results
+    return _extract_bumps_results(
+        problem=problem,
+        fit_result=result,
+        method=method,
+        iteration=iteration,
+        export_dir=export_dir,
+    )
+
+
+def _run_refl1d_fit_legacy(
+    model_script: str,
+    method: str = "lm",
+    iteration: int = 0,
+    steps: int = 1000,
+    burn: int = 1000,
+    export_dir: Optional[str] = None,
+) -> FitResult:
+    """Legacy exec-based fitting for old script-string models."""
+    from bumps.fitters import fit as bumps_fit
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Write model script
         model_file = Path(tmpdir) / "model.py"
         model_file.write_text(model_script)
 
-        # Execute model script to get the problem object
         model_globals = {"__file__": str(model_file)}
         exec(compile(model_script, model_file, "exec"), model_globals)
 
-        # Get the problem from the executed script
         problem = model_globals.get("problem")
         if problem is None:
             raise ValueError("Model script must define a 'problem' variable")
 
-        # Configure fit options based on method
-        fit_options = {
-            "method": method,
-            "parallel": 0,
-        }
+        fit_options = _build_fit_options(method, steps, burn, export_dir)
 
-        if method == "dream":
-            fit_options["samples"] = steps
-            fit_options["burn"] = burn
-            fit_options["pop"] = 10  # Population multiplier
-            fit_options["thin"] = 1
-            fit_options["alpha"] = (
-                0.0  # Convergence criterion (0 = no convergence check)
-            )
-            fit_options["trim"] = False
-            fit_options["steps"] = 0
-        elif method == "de":
-            fit_options["steps"] = steps
-            fit_options["pop"] = 10
-        elif method == "lm":
-            fit_options["steps"] = steps
-
-        # Export refl1d output (MCMC chains, profiles, etc.)
-        if export_dir:
-            fit_options["export"] = export_dir
-            logger.info(f"[FITTING] Exporting refl1d output to {export_dir}")
-
-        # Run the fit
-        logger.info(f"[FITTING] Running {method.upper()} with bumps.fit...")
+        logger.info(f"[FITTING] Running {method.upper()} with bumps.fit (legacy)...")
         result = bumps_fit(problem, **fit_options)
 
-        # Extract results
         return _extract_bumps_results(
             problem=problem,
             fit_result=result,
@@ -179,6 +191,36 @@ def run_refl1d_fit(
             iteration=iteration,
             export_dir=export_dir,
         )
+
+
+def _build_fit_options(
+    method: str, steps: int, burn: int, export_dir: Optional[str]
+) -> dict:
+    """Build the options dict for bumps.fitters.fit."""
+    fit_options = {
+        "method": method,
+        "parallel": 0,
+    }
+
+    if method == "dream":
+        fit_options["samples"] = steps
+        fit_options["burn"] = burn
+        fit_options["pop"] = 10
+        fit_options["thin"] = 1
+        fit_options["alpha"] = 0.0
+        fit_options["trim"] = False
+        fit_options["steps"] = 0
+    elif method == "de":
+        fit_options["steps"] = steps
+        fit_options["pop"] = 10
+    elif method == "lm":
+        fit_options["steps"] = steps
+
+    if export_dir:
+        fit_options["export"] = export_dir
+        logger.info(f"[FITTING] Exporting refl1d output to {export_dir}")
+
+    return fit_options
 
 
 def _extract_bumps_results(

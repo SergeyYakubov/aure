@@ -18,6 +18,18 @@ from .checkpoints import CheckpointManager, get_node_after
 from .tracing import get_trace_context, run_with_tracing, TracedWorkflow
 
 
+def _rejoin_messages(data: object) -> None:
+    """Rejoin message content arrays back to strings (in-place)."""
+    if isinstance(data, dict):
+        if "role" in data and "content" in data and isinstance(data["content"], list):
+            data["content"] = "\n".join(data["content"])
+        for v in data.values():
+            _rejoin_messages(v)
+    elif isinstance(data, list):
+        for item in data:
+            _rejoin_messages(item)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -57,8 +69,10 @@ def _load_checkpoint_by_iteration(
         return None
     for cp_file in sorted(cp_dir.glob("*.json")):
         try:
-            cp_data = _json.loads(cp_file.read_text())
+            cp_data = _json.loads(cp_file.read_text(encoding="utf-8"))
             cp_state = cp_data.get("state", cp_data)
+            # Rejoin message content arrays that were split for readability
+            _rejoin_messages(cp_state)
             if cp_state.get("iteration") == iteration:
                 return cp_state
         except Exception:
@@ -322,7 +336,8 @@ def prepare_state_for_restart(
             change or try differently.
         restart_from: Node to restart from. ``"modeling"`` (default) re-builds
             and re-fits the model.  ``"analysis"`` re-analyses features and
-            re-builds from scratch.
+            re-builds from scratch.  ``"fitting"`` re-fits directly with the
+            current model parameters (skips LLM refinement).
         extra_iterations: Number of additional iterations to allow beyond
             those already consumed (default: 3).
 

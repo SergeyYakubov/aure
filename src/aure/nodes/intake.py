@@ -51,12 +51,31 @@ def parse_sample_with_llm(
     # Extract JSON from response
     content = response.content
 
+    # Strip markdown code fences the LLM may wrap the JSON in
+    content = re.sub(r"^```(?:json)?\s*\n", "", content)
+    content = re.sub(r"\n```\s*$", "", content)
+    content = content.strip()
+
     # Try to find JSON block in the response
     json_match = re.search(r"\{[\s\S]*\}", content)
     if json_match:
-        return json.loads(json_match.group())
+        raw_json = json_match.group()
+        return json.loads(_fix_llm_json(raw_json))
 
     raise ValueError("Could not extract JSON from LLM response")
+
+
+def _fix_llm_json(text: str) -> str:
+    """Best-effort fix-up of common LLM JSON mistakes.
+
+    Handles trailing commas before ``}`` or ``]`` and single-line
+    ``// ...`` comments.
+    """
+    # Remove single-line comments (// ...)
+    text = re.sub(r"//[^\n]*", "", text)
+    # Remove trailing commas before } or ]
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    return text
 
 
 def intake_node(state: ReflectivityState) -> Dict[str, Any]:
