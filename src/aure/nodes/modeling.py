@@ -478,17 +478,17 @@ def build_refl1d_script(
             stack_parts.append(
                 f"material{i + 1}({layer['thickness']:.1f}, {layer['roughness']:.1f})"
             )
-        stack_parts.append(f"substrate(0, {substrate.get('roughness', 3.0):.1f})")
+        stack_parts.append("substrate")
     else:
         # Normal geometry: neutrons come from ambient side
-        # Stack: ambient | layer1 | layer2 | ... | substrate
-        lines.append("# Built from ambient (top) to substrate (bottom)")
-        stack_parts = ["ambient"]
+        # Stack: substrate | layer1 | layer2 | ... | ambient
+        lines.append("# Built from substrate (bottom) to ambient (top)")
+        stack_parts = [f"substrate(0, {substrate.get('roughness', 3.0):.1f})"]
         for i, layer in enumerate(layers):
             stack_parts.append(
                 f"material{i + 1}({layer['thickness']:.1f}, {layer['roughness']:.1f})"
             )
-        stack_parts.append(f"substrate(0, {substrate.get('roughness', 3.0):.1f})")
+        stack_parts.append("ambient")
 
     lines.append(f"sample = {' | '.join(stack_parts)}")
 
@@ -505,9 +505,11 @@ def build_refl1d_script(
         # Allow ±20% variation around the expected SLD
         ambient_min = max(ambient_sld * 0.8, -1.0)
         ambient_max = ambient_sld * 1.2
-        # Ambient is always first (index 0) in both geometries now
+        # Back reflection: ambient is first (index 0)
+        # Normal geometry: ambient is last (index len(layers) + 1)
+        ambient_idx = 0 if back_reflection else len(layers) + 1
         lines.append(
-            f"sample[0].material.rho.range({ambient_min:.2f}, {ambient_max:.2f})"
+            f"sample[{ambient_idx}].material.rho.range({ambient_min:.2f}, {ambient_max:.2f})"
         )
 
     # Add parameter ranges for layers
@@ -518,7 +520,7 @@ def build_refl1d_script(
             # e.g., for 2 layers: layers[0]=material1 at idx 2, layers[1]=material2 at idx 1
             idx = len(layers) - i
         else:
-            # In normal geometry: ambient is index 0, layers start at index 1
+            # In normal geometry: substrate is index 0, layers start at index 1
             idx = i + 1
 
         # Thickness
@@ -535,9 +537,14 @@ def build_refl1d_script(
         r_max = layer.get("roughness_max", 30.0)
         lines.append(f"sample[{idx}].interface.range(0, {r_max:.1f})")
 
-    # Substrate roughness (substrate is always last)
-    sub_rough_max = substrate.get("roughness_max", 15.0)
-    lines.append(f"sample[{len(layers) + 1}].interface.range(0, {sub_rough_max:.1f})")
+    # First-element interface roughness (leftmost medium in the stack)
+    if back_reflection:
+        # Ambient is first: vary ambient/layer interface roughness
+        lines.append("sample[0].interface.range(0, 30.0)")
+    else:
+        # Substrate is first: vary substrate/layer interface roughness
+        sub_rough_max = substrate.get("roughness_max", 15.0)
+        lines.append(f"sample[0].interface.range(0, {sub_rough_max:.1f})")
     # Probe intensity normalization
     if not intensity.get("fixed", False):
         lines.extend(

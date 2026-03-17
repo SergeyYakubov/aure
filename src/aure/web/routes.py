@@ -215,7 +215,8 @@ def api_simulate():
     Expects JSON body::
 
         {
-            "parameters": {"param name": value, ...}
+            "parameters": {"param name": value, ...},
+            "bounds": {"param name": [lo, hi], ...}   // optional
         }
 
     Returns ``{Q_fit, R_fit, sld_z, sld_rho, chi_squared}``.
@@ -235,7 +236,20 @@ def api_simulate():
     except (ValueError, TypeError):
         return jsonify({"error": "All parameter values must be numeric"}), 400
 
-    result = rd.simulate(parameters)
+    # Optional bounds overrides from the UI
+    raw_bounds = body.get("bounds")
+    bounds: dict | None = None
+    if raw_bounds and isinstance(raw_bounds, dict):
+        try:
+            bounds = {
+                str(k): [float(v[0]), float(v[1])]
+                for k, v in raw_bounds.items()
+                if isinstance(v, list) and len(v) == 2
+            }
+        except (ValueError, TypeError, IndexError):
+            bounds = None
+
+    result = rd.simulate(parameters, bounds=bounds)
     if "error" in result:
         return jsonify(result), 500
     return jsonify(result)

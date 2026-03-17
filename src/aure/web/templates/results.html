@@ -530,15 +530,19 @@ async function _runSimulation() {
   document.getElementById("sim-spinner").classList.remove("d-none");
 
   const params = {};
+  const bounds = {};
   for (const [name, ps] of Object.entries(_paramState)) {
     params[name] = ps.value;
+    if (ps.lo != null && ps.hi != null) {
+      bounds[name] = [ps.lo, ps.hi];
+    }
   }
 
   try {
     const resp = await fetch("/api/simulate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ parameters: params }),
+      body: JSON.stringify({ parameters: params, bounds: bounds }),
     });
     const data = await resp.json();
     if (data.error) {
