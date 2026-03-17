@@ -377,17 +377,12 @@ def _build_layers(parsed: dict, features: dict) -> List[dict]:
                     layer["roughness"], features["estimated_roughness"]
                 )
 
-        # Use oscillation-based thickness if available
-        if (
-            features.get("oscillation_periods")
-            and len(features["oscillation_periods"]) > 0
-        ):
-            # Use first oscillation period as thickness estimate
-            period = features["oscillation_periods"][0]
-            if "thickness" in period and len(layers) == 1:
-                layers[0]["thickness"] = period["thickness"]
-                layers[0]["thickness_min"] = period["thickness"] * 0.7
-                layers[0]["thickness_max"] = period["thickness"] * 1.3
+        # Use fringe-spacing thickness if available and single-layer
+        est_thick = features.get("estimated_total_thickness")
+        if est_thick and len(layers) == 1:
+            layers[0]["thickness"] = est_thick
+            layers[0]["thickness_min"] = est_thick * 0.5
+            layers[0]["thickness_max"] = est_thick * 2.0
 
     return layers
 

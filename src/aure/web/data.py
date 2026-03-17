@@ -208,7 +208,15 @@ class RunData:
                 }
             )
 
-        return {"Q": Q, "R": R, "dR": dR, "models": models}
+        # Identify best-chi2 iteration index
+        best_iteration = None
+        best_chi2 = float("inf")
+        for i, m in enumerate(models):
+            if m["chi2"] is not None and m["chi2"] < best_chi2:
+                best_chi2 = m["chi2"]
+                best_iteration = i
+
+        return {"Q": Q, "R": R, "dR": dR, "models": models, "best_iteration": best_iteration}
 
     # ------------------------------------------------------------------
     # SLD profiles  (requires refl1d model execution)
@@ -276,9 +284,14 @@ class RunData:
     # Fit parameters
     # ------------------------------------------------------------------
 
-    def get_fit_parameters(self) -> dict:
-        """
-        Return parameters from the latest fit result.
+    def get_fit_parameters(self, iteration: int | None = None) -> dict:
+        """Return parameters for a specific fit iteration.
+
+        Parameters
+        ----------
+        iteration
+            0-based index into ``fit_results``.  When *None* (default),
+            the iteration with the lowest chi-squared is used.
 
         Returns::
 
@@ -286,6 +299,8 @@ class RunData:
                 "chi_squared": float,
                 "method": str,
                 "converged": bool,
+                "iteration": int,
+                "best_iteration": int,
                 "parameters": [{"name": ..., "value": ..., "uncertainty": ...,
                                 "bounds": [lo, hi] | null}],
             }
@@ -298,12 +313,26 @@ class RunData:
                 "chi_squared": None,
                 "method": None,
                 "converged": None,
+                "iteration": None,
+                "best_iteration": None,
             }
 
-        latest = fit_results[-1]
-        params = latest.get("parameters", {})
-        uncertainties = latest.get("uncertainties") or {}
-        bounds = latest.get("bounds") or {}
+        # Find best-chi2 iteration
+        best_idx = 0
+        best_chi2 = float("inf")
+        for i, fr in enumerate(fit_results):
+            c = fr.get("chi_squared")
+            if c is not None and c < best_chi2:
+                best_chi2 = c
+                best_idx = i
+
+        idx = iteration if iteration is not None else best_idx
+        idx = max(0, min(idx, len(fit_results) - 1))
+
+        selected = fit_results[idx]
+        params = selected.get("parameters", {})
+        uncertainties = selected.get("uncertainties") or {}
+        bounds = selected.get("bounds") or {}
 
         # Fallback: read bounds from problem.json when not stored in state
         if not bounds:
@@ -321,9 +350,11 @@ class RunData:
             )
 
         return {
-            "chi_squared": latest.get("chi_squared"),
-            "method": latest.get("method"),
-            "converged": latest.get("converged"),
+            "chi_squared": selected.get("chi_squared"),
+            "method": selected.get("method"),
+            "converged": selected.get("converged"),
+            "iteration": idx,
+            "best_iteration": best_idx,
             "parameters": rows,
         }
 

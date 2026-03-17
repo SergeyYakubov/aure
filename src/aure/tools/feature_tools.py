@@ -149,7 +149,6 @@ def extract_kiessig_fringes(
     if len(Q_analysis) < 20:
         return {
             "oscillation_periods": [],
-            "thicknesses": [],
             "n_fringes": 0,
             "method": "fft",
         }
@@ -183,17 +182,14 @@ def extract_kiessig_fringes(
     )
     peaks = peaks + min_freq_idx
 
-    # Convert frequencies to thicknesses
+    # Convert frequencies to oscillation periods
     oscillation_periods = []
-    thicknesses = []
 
     for peak_idx in peaks:
         freq = freqs[peak_idx]
         if freq > 0:
             # Period in Q space
             period = 1.0 / freq
-            # Thickness: d ≈ 2π / ΔQ
-            thickness = 2 * np.pi / period
 
             oscillation_periods.append(
                 {
@@ -202,14 +198,12 @@ def extract_kiessig_fringes(
                     "amplitude": float(power[peak_idx]),
                 }
             )
-            thicknesses.append(float(thickness))
 
     # Also count fringes directly
     n_fringes = count_fringes_direct(Q_analysis, R_analysis)
 
     return {
         "oscillation_periods": oscillation_periods,
-        "thicknesses": thicknesses,
         "n_fringes": n_fringes,
         "method": "fft",
     }
@@ -241,8 +235,8 @@ def count_fringes_direct(
     else:
         log_R_smooth = log_R
 
-    # Find minima
-    minima, _ = find_peaks(-log_R_smooth, distance=5)
+    # Find minima — require prominence to reject noise wiggles
+    minima, _ = find_peaks(-log_R_smooth, distance=5, prominence=0.05)
 
     return len(minima)
 
@@ -286,8 +280,8 @@ def estimate_total_thickness(
         window += 1
     log_R_smooth = savgol_filter(log_R, window, 2)
 
-    # Find minima
-    minima, _ = find_peaks(-log_R_smooth, distance=5)
+    # Find minima — require prominence to reject noise wiggles
+    minima, _ = find_peaks(-log_R_smooth, distance=5, prominence=0.05)
 
     if len(minima) < 2:
         return {
@@ -450,7 +444,7 @@ def estimate_layer_count(
     """
     # Count indicators
     n_critical_edges = len(critical_edges)
-    n_oscillation_freqs = len(oscillation_info.get("thicknesses", []))
+    n_oscillation_freqs = len(oscillation_info.get("oscillation_periods", []))
     n_fringes = oscillation_info.get("n_fringes", 0)
 
     # Simple heuristic
@@ -531,7 +525,6 @@ def extract_all_features(
         "n_critical_edges": len(critical_edges),
         # Oscillation information
         "oscillation_periods": oscillation_info.get("oscillation_periods", []),
-        "thicknesses": oscillation_info.get("thicknesses", []),
         "n_fringes": oscillation_info.get("n_fringes", 0),
         # Total thickness
         "estimated_total_thickness": thickness_info.get("thickness"),
@@ -590,11 +583,6 @@ def format_features_for_llm(features: Dict) -> str:
     else:
         lines.append("- Could not estimate thickness from fringe pattern")
     lines.append(f"- Number of fringes detected: {features['n_fringes']}")
-
-    if features["thicknesses"]:
-        lines.append("- Individual layer thickness candidates:")
-        for d in features["thicknesses"][:5]:  # Limit to 5
-            lines.append(f"  - {d:.1f} Å")
     lines.append("")
 
     # Roughness

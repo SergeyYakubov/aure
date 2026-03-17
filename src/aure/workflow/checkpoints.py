@@ -232,11 +232,23 @@ class CheckpointManager:
         if not fit_results:
             return
 
-        last_fit = fit_results[-1]
-        params: dict = last_fit.get("parameters", {})
-        uncertainties: dict = last_fit.get("uncertainties") or {}
-        chi2 = last_fit.get("chi_squared")
-        method = last_fit.get("method", "unknown")
+        # Use the fit result that matches best_chi2 (not necessarily the last)
+        best_chi2_val = state.get("best_chi2")
+        best_fit = None
+        if best_chi2_val is not None:
+            for fr in fit_results:
+                if fr.get("chi_squared") == best_chi2_val:
+                    best_fit = fr
+                    break
+        if best_fit is None:
+            best_fit = min(
+                fit_results, key=lambda f: f.get("chi_squared", float("inf"))
+            )
+
+        params: dict = best_fit.get("parameters", {})
+        uncertainties: dict = best_fit.get("uncertainties") or {}
+        chi2 = best_fit.get("chi_squared")
+        method = best_fit.get("method", "unknown")
 
         if not params:
             return

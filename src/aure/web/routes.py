@@ -205,7 +205,8 @@ def api_parameters():
     rd = _run_data()
     if not rd:
         return jsonify({"parameters": []})
-    return jsonify(rd.get_fit_parameters())
+    iteration = request.args.get("iteration", default=None, type=int)
+    return jsonify(rd.get_fit_parameters(iteration=iteration))
 
 
 @bp.route("/api/simulate", methods=["POST"])
