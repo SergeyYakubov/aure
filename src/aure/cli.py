@@ -190,8 +190,6 @@ def _check_llm_status(
                 or "api_key_invalid" in error_lower
                 or ("invalid" in error_lower and "key" in error_lower)
             ):
-                print(error_msg)
-                print(error_lower)
                 short_msg = "Invalid API key"
                 if not quiet:
                     click.echo(click.style(f" ✗ {short_msg}", fg="red"))
@@ -643,7 +641,6 @@ def _print_analysis_results(result: dict, output_dir: Optional[str] = None):
     # Model
     if result.get("current_model"):
         click.echo(click.style("  Final Model", fg="green", bold=True))
-        click.echo("Current model:")
         click.echo(result.get("current_model"))
 #        model_lines = result["current_model"].split("\n")
 #        click.echo(f"    Script: {len(model_lines)} lines")
